@@ -403,16 +403,136 @@ ${JSON.stringify(card, null, 2)}
 `.trim();
 }
 
-function extractJson(text) {
-    if (!text) throw new Error('Empty LLM response');
-    let s = String(text).trim();
-    const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
+function stripThinkingAndFences(text) {
+    let s = String(text ?? '').trim();
+    s = s.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+    s = s.replace(/<analysis>[\s\S]*?<\/analysis>/gi, '').trim();
+    const fence = s.match(/```(?:json|javascript|js)?\s*([\s\S]*?)```/i);
     if (fence) s = fence[1].trim();
-    try { return JSON.parse(s); }
-    catch (_) {
-        const a = s.indexOf('{'), b = s.lastIndexOf('}');
-        if (a >= 0 && b > a) return JSON.parse(s.slice(a,b+1));
-        throw new Error('模型没有返回有效JSON');
+    return s;
+}
+
+function extractBalancedObject(text) {
+    const s = String(text ?? '');
+    const start = s.indexOf('{');
+    if (start < 0) return s.trim();
+
+    let depth = 0;
+    let inString = false;
+    let quote = '';
+    let escape = false;
+
+    for (let i = start; i < s.length; i++) {
+        const ch = s[i];
+
+        if (inString) {
+            if (escape) { escape = false; continue; }
+            if (ch === '\\') { escape = true; continue; }
+            if (ch === quote) { inString = false; quote = ''; }
+            continue;
+        }
+
+        if (ch === '"' || ch === "'") {
+            inString = true;
+            quote = ch;
+            continue;
+        }
+
+        if (ch === '{') depth++;
+        if (ch === '}') {
+            depth--;
+            if (depth === 0) return s.slice(start, i + 1);
+        }
+    }
+    return s.slice(start).trim();
+}
+
+function normalizeJsonLike(text) {
+    let s = String(text ?? '').trim();
+
+    s = s.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
+    s = s.replace(/\/\*[\s\S]*?\*\//g, '');
+    s = s.replace(/(^|[^:])\/\/.*$/gm, '$1');
+
+    // Quote simple unquoted object keys.
+    s = s.replace(/([{,]\s*)([A-Za-z_$][A-Za-z0-9_$-]*)(\s*:)/g, '$1"$2"$3');
+
+    // Convert common single-quoted JS/Python strings.
+    s = s.replace(/'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_, body) => {
+        const fixed = body.replace(/\\'/g, "'").replace(/"/g, '\\"');
+        return `"${fixed}"`;
+    });
+
+    s = s.replace(/,\s*([}\]])/g, '$1');
+    s = s.replace(/\bNone\b/g, 'null')
+         .replace(/\bTrue\b/g, 'true')
+         .replace(/\bFalse\b/g, 'false');
+
+    return s.trim();
+}
+
+function parseJsonTolerant(text) {
+    const raw = stripThinkingAndFences(text);
+    const attempts = [
+        raw,
+        extractBalancedObject(raw),
+        normalizeJsonLike(raw),
+        normalizeJsonLike(extractBalancedObject(raw)),
+    ];
+
+    let lastError = null;
+    for (const attempt of attempts) {
+        if (!attempt) continue;
+        try {
+            return JSON.parse(attempt);
+        } catch (err) {
+            lastError = err;
+        }
+    }
+    throw lastError ?? new Error('模型没有返回有效JSON');
+}
+
+async function repairJsonWithModel(rawText, purpose = 'state analysis') {
+    const c = ctx();
+    if (!c?.generateQuietPrompt) throw new Error('无法调用模型修复JSON');
+
+    const repairPrompt = `
+You repair malformed JSON.
+Return ONLY one strict RFC 8259 JSON object.
+Do not explain anything.
+Do not add, remove, reinterpret, or invent semantic data.
+Only fix syntax: quotes, commas, escaping, wrappers, comments, or invalid literals.
+
+PURPOSE:
+${purpose}
+
+MALFORMED OUTPUT:
+${String(rawText ?? '').slice(0, 24000)}
+`.trim();
+
+    return await c.generateQuietPrompt({
+        quietPrompt: repairPrompt,
+        quietToLoud: false,
+        skipWIAN: true,
+    });
+}
+
+async function parseModelJson(text, purpose = 'state analysis') {
+    try {
+        return parseJsonTolerant(text);
+    } catch (firstError) {
+        console.warn('[Psychology Engine] local JSON parse failed; trying repair pass', firstError);
+        const repaired = await repairJsonWithModel(text, purpose);
+        try {
+            return parseJsonTolerant(repaired);
+        } catch (secondError) {
+            const err = new Error(
+                `JSON解析失败。首次错误：${firstError?.message ?? firstError}；修复后错误：${secondError?.message ?? secondError}`
+            );
+            err.rawResponse = String(text ?? '');
+            err.repairedResponse = String(repaired ?? '');
+            throw err;
+        }
     }
 }
 
@@ -514,7 +634,7 @@ async function generateCharacterProfile() {
         skipWIAN: false,
     });
 
-    const parsed = extractJson(raw);
+    const parsed = await parseModelJson(raw, 'character profile initialization');
     pendingProfile = normalizeProfile(parsed);
     showProfilePreview(pendingProfile);
     updateStatus('等待确认初始化');
@@ -875,7 +995,7 @@ async function analyzeNow({force=false}={}) {
         const raw=await c.generateQuietPrompt({
             quietPrompt:analyzerPrompt(),quietToLoud:false,skipWIAN:false
         });
-        const result=extractJson(raw);
+        const result=await parseModelJson(raw, 'state analysis');
         applyAnalysis(result);
         s.runtime.lastAnalyzedMessageId=lastId;
         s.runtime.analyzerErrors=[];
@@ -886,7 +1006,7 @@ async function analyzeNow({force=false}={}) {
     } catch(err) {
         console.error('[Psychology Engine] analyzer failed',err);
         s.runtime.analyzerErrors ??=[];
-        s.runtime.analyzerErrors.push({at:nowIso(),message:String(err?.message??err)});
+        s.runtime.analyzerErrors.push({at:nowIso(),message:String(err?.message??err),rawResponse:String(err?.rawResponse??'').slice(0,12000),repairedResponse:String(err?.repairedResponse??'').slice(0,12000)});
         s.runtime.analyzerErrors=s.runtime.analyzerErrors.slice(-10);
         saveState();
         updateStatus('分析失败');

@@ -1,6 +1,30 @@
+
+### v0.2.2 JSON 稳定性修正
+
+模型偶尔会返回“类 JSON”而不是严格 JSON，例如：
+
+```text
+{'Trust': 2}
+{Trust: 2}
+```
+
+v0.2.2 现在按以下顺序解析：
+
+```text
+严格 JSON.parse
+→ 提取首个完整对象
+→ 本地宽松语法修复
+→ 再解析
+→ 若仍失败，调用一次 quiet generation，只修复 JSON 语法
+→ 最终失败才报错
+```
+
+同时内部错误日志会保留原始输出与修复输出，便于定位。
+
+
 # SillyTavern Psychology Engine
 
-## v0.2.1 — Character Profile Initializer + World Info Fix
+## v0.2.2 — Character Profile Initializer + World Info Fix
 
 一个前端-only 的 SillyTavern 扩展，用于维护任意角色之间的 **有向心理关系状态**：
 

@@ -1,5 +1,44 @@
 
-### v0.2.3 后台上下文隔离修正
+### v0.2.4 关键修正
+
+#### 1. Character Initializer 瘦身
+旧版要求模型一次生成完整 18×参数表，输出过大且容易产生无效 JSON。
+
+新版只要求模型输出：
+- 7 个 Personality Control
+- 11 个高层 Style Traits
+- 角色 → user 的初始关系
+- 卡内明确存在的其他关系
+
+完整 Normal / Absolute Bounds、Sensitivity、Expression 等由插件代码自动派生。
+
+#### 2. 未初始化角色禁止直接状态分析
+旧版可以在 Profile 尚未初始化时点击“立即分析聊天”，导致未知关系被错误地从 0 开始更新。
+
+新版：
+```text
+当前角色未确认 Profile
+→ 状态分析被阻止
+→ 必须先初始化角色
+```
+
+#### 3. 防止“25 / 35 全变量撞限”
+旧版单次 Delta 限幅为：
+```text
+core ±25
+derived ±35
+```
+当模型错误地更新所有变量时，就会出现整排 25 / 35。
+
+新版：
+- core 单次硬限幅降为 ±12
+- derived 单次硬限幅降为 ±20
+- 一次更新若 core > 8 项或 derived > 6 项，直接拒绝整条 update
+- Prompt 明确要求普通事件保持稀疏更新
+
+
+
+### v0.2.4 — Compact Initializer + Safe State Updates
 
 此前 Character Initializer / State Analyzer 使用 quiet generation 时仍允许 World Info / Author's Note 注入，
 可能导致后台分析模型误以为自己仍在进行角色扮演，从而返回：

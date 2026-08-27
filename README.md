@@ -1,5 +1,48 @@
 
-### v0.2.7：修复 jsonSchema 返回 `{}` 的兼容问题
+### v0.2.8：默认禁用 Structured Output
+
+确认一个插件实现错误：SillyTavern 的 `jsonSchema` 需要包装为：
+
+```js
+{
+  name: "schema_name",
+  strict: true,
+  value: {
+    type: "object",
+    properties: { ... }
+  }
+}
+```
+
+旧版本错误地直接传入内部 JSON Schema。
+
+此外，SillyTavern 的 structured-output 路径存在把损坏 JSON 解析为 `{}` 的历史兼容问题。
+
+为了优先保证可用性，v0.2.8 暂时不使用 `jsonSchema`：
+
+```text
+generateRaw(plain prompt + isolated systemPrompt)
+→ 模型文本JSON
+→ 插件本地宽松JSON解析
+→ Profile校验
+```
+
+新增“测试后台模型调用”按钮。它只要求模型返回：
+
+```json
+{"ok":true,"source":"psychology-engine"}
+```
+
+并显示 Background Call Debug。
+
+这样可以先判断：
+- `generateRaw()` 本身是否正常；
+- 是否是角色初始化 prompt 的问题；
+- 是否是模型/API 层对 raw generation 的兼容问题。
+
+
+
+### v0.2.8 — Plain Raw JSON Mode
 
 部分 API / 模型连接不会对 `jsonSchema` 抛错，而是直接返回：
 

@@ -78,7 +78,7 @@ function nowIso() { return new Date().toISOString(); }
 
 function newState() {
     return {
-        schemaVersion: '0.2.7',
+        schemaVersion: '0.2.8',
         characters: {},
         relations: {},
         events: {},
@@ -350,6 +350,8 @@ function hasAnalyzerShape(raw) {
     }
 }
 
+let lastBackgroundDebug = null;
+
 async function generateBackgroundRaw({
     prompt,
     purpose,
@@ -360,58 +362,57 @@ async function generateBackgroundRaw({
     const c = ctx();
     if (!c?.generateRaw) throw new Error('当前 SillyTavern 上下文不支持 generateRaw()');
 
-    const baseOptions = {
-        prompt,
+    const finalPrompt = `
+${prompt}
+
+FINAL OUTPUT REQUIREMENT:
+Return ONLY one strict RFC 8259 JSON object.
+Do not use markdown fences.
+Do not prepend or append explanations.
+Do not return an empty object.
+`.trim();
+
+    const options = {
+        prompt: finalPrompt,
         systemPrompt: backgroundSystemPrompt(purpose),
         responseLength,
         trimNames: false,
         quietToLoud: false,
     };
 
-    // First attempt: structured output if requested.
-    if (jsonSchema) {
-        try {
-            const structured = await c.generateRaw({
-                ...baseOptions,
-                jsonSchema,
-            });
+    lastBackgroundDebug = {
+        purpose,
+        mode: 'plain-generateRaw',
+        startedAt: nowIso(),
+        response: null,
+        error: null,
+    };
 
-            const semanticallyEmpty = looksLikeEmptyStructuredOutput(structured);
-            const shapeInvalid = typeof validateShape === 'function'
-                ? !validateShape(structured)
-                : false;
+    try {
+        const raw = await c.generateRaw(options);
+        lastBackgroundDebug.response = typeof raw === 'string'
+            ? raw
+            : JSON.stringify(raw, null, 2);
+        lastBackgroundDebug.finishedAt = nowIso();
 
-            if (!semanticallyEmpty && !shapeInvalid) {
-                return structured;
-            }
-
-            console.warn(
-                '[Psychology Engine] structured output returned empty/invalid shape; retrying without jsonSchema',
-                structured
-            );
-        } catch (err) {
-            console.warn(
-                '[Psychology Engine] structured raw generation failed; retrying without jsonSchema',
-                err
-            );
+        if (looksLikeEmptyStructuredOutput(raw)) {
+            throw new Error('generateRaw 返回空结果或空对象 {}');
         }
+
+        if (typeof validateShape === 'function' && !validateShape(raw)) {
+            // Do not fail here: the tolerant parser/validator may still be able
+            // to unwrap alternate but semantically useful shapes.
+            lastBackgroundDebug.shapeWarning = true;
+        }
+
+        return raw;
+    } catch (err) {
+        lastBackgroundDebug.error = String(err?.message ?? err);
+        lastBackgroundDebug.finishedAt = nowIso();
+        const wrapped = new Error(`后台 generateRaw 调用失败：${err?.message ?? err}`);
+        wrapped.backgroundDebug = structuredClone(lastBackgroundDebug);
+        throw wrapped;
     }
-
-    // Second attempt: plain raw generation, fully isolated from RP context.
-    const plainPrompt = `
-${prompt}
-
-FINAL OUTPUT REQUIREMENT:
-Return ONLY one strict JSON object.
-Do not use markdown fences.
-Do not prepend or append explanations.
-Do not return an empty object unless the requested schema explicitly permits it.
-`.trim();
-
-    return await c.generateRaw({
-        ...baseOptions,
-        prompt: plainPrompt,
-    });
 }
 
 function initializerJsonSchema() {
@@ -997,7 +998,7 @@ function normalizeProfile(raw) {
     }
 
     const profile = {
-        version: '0.2.7',
+        version: '0.2.8',
         character: name,
         evidenceSummary: Array.isArray(raw?.evidenceSummary)
             ? raw.evidenceSummary.map(String).filter(Boolean).slice(0,20)
@@ -1053,6 +1054,32 @@ function normalizeProfile(raw) {
     return profile;
 }
 
+async function testBackgroundGeneration() {
+    const raw = await generateBackgroundRaw({
+        prompt: 'Return exactly this JSON object: {"ok":true,"source":"psychology-engine"}',
+        purpose: 'perform a minimal JSON connectivity self-test',
+        responseLength: 128,
+        jsonSchema: null,
+        validateShape: null,
+    });
+
+    let parsed;
+    try {
+        parsed = parseJsonTolerant(raw);
+    } catch (err) {
+        throw new Error(`后台调用有返回，但不是JSON：${String(raw).slice(0,500)}`);
+    }
+
+    if (parsed?.ok !== true) {
+        throw new Error(`后台调用返回异常：${String(raw).slice(0,500)}`);
+    }
+
+    const state = getState();
+    state.runtime.lastBackgroundDebug = structuredClone(lastBackgroundDebug);
+    saveState();
+    return parsed;
+}
+
 async function generateCharacterProfile() {
     const c = ctx();
     if (!c?.generateRaw) throw new Error('当前 SillyTavern 上下文不支持 generateRaw()');
@@ -1063,13 +1090,14 @@ async function generateCharacterProfile() {
         prompt: initializerPrompt(),
         purpose: 'analyze a character card and return a compact Psychology Profile JSON',
         responseLength: 4096,
-        jsonSchema: initializerJsonSchema(),
+        jsonSchema: null,
         validateShape: hasInitializerShape,
     });
 
     const parsed = await parseModelJson(raw, 'character profile initialization');
 
     const state = getState();
+    state.runtime.lastBackgroundDebug = structuredClone(lastBackgroundDebug);
     state.runtime.lastInitializerRaw = typeof raw === 'string'
         ? raw
         : JSON.stringify(raw, null, 2);
@@ -1157,12 +1185,16 @@ function renderInitializerDebug() {
     const wrap = document.getElementById('psy_initializer_debug_wrap');
     const rawBox = document.getElementById('psy_initializer_raw');
     const parsedBox = document.getElementById('psy_initializer_parsed');
-    if (!wrap || !rawBox || !parsedBox) return;
+    const bgBox = document.getElementById('psy_background_debug');
+    if (!wrap || !rawBox || !parsedBox || !bgBox) return;
 
     const rt = getState()?.runtime ?? {};
     rawBox.value = String(rt.lastInitializerRaw ?? '');
     parsedBox.value = rt.lastInitializerParsed
         ? JSON.stringify(rt.lastInitializerParsed, null, 2)
+        : '';
+    bgBox.value = rt.lastBackgroundDebug
+        ? JSON.stringify(rt.lastBackgroundDebug, null, 2)
         : '';
 
     wrap.style.display = 'block';
@@ -1473,7 +1505,7 @@ async function analyzeNow({force=false}={}) {
             prompt: analyzerPrompt(),
             purpose: 'analyze recent roleplay events and return Psychology Engine event/knowledge/update JSON',
             responseLength: 4096,
-            jsonSchema: analyzerJsonSchema(),
+            jsonSchema: null,
             validateShape: hasAnalyzerShape,
         });
         const result=await parseModelJson(raw, 'state analysis');
@@ -1573,6 +1605,7 @@ function buildSettingsUi() {
         <div id="psy_initializer_status"></div>
         <div class="psy-buttons">
           <button id="psy_show_init_raw" class="menu_button">查看初始化原始输出</button>
+          <button id="psy_test_background" class="menu_button">测试后台模型调用</button>
           <button id="psy_init_ai" class="menu_button">AI分析当前角色卡</button>
           <button id="psy_show_profile" class="menu_button">查看已确认Profile</button>
         </div>
@@ -1585,6 +1618,9 @@ function buildSettingsUi() {
           </label>
           <label>Parsed Output
             <textarea id="psy_initializer_parsed" class="text_pole" rows="8" readonly></textarea>
+          </label>
+          <label>Background Call Debug
+            <textarea id="psy_background_debug" class="text_pole" rows="8" readonly></textarea>
           </label>
           <div class="psy-buttons">
             <button id="psy_initializer_debug_close" class="menu_button">关闭</button>
@@ -1643,6 +1679,23 @@ function buildSettingsUi() {
     document.getElementById('psy_show_init_raw')?.addEventListener('click',()=>{
         renderInitializerDebug();
     });
+    document.getElementById('psy_test_background')?.addEventListener('click',async()=>{
+        updateStatus('测试后台模型调用…');
+        try {
+            await testBackgroundGeneration();
+            updateStatus('后台模型调用正常');
+            renderInitializerDebug();
+            toast('success','后台 generateRaw JSON 测试成功');
+        } catch(err) {
+            const state=getState();
+            if (err?.backgroundDebug) state.runtime.lastBackgroundDebug=err.backgroundDebug;
+            else if (lastBackgroundDebug) state.runtime.lastBackgroundDebug=structuredClone(lastBackgroundDebug);
+            saveState();
+            updateStatus('后台模型调用失败');
+            renderInitializerDebug();
+            toast('error',`后台模型调用失败：${err?.message??err}`);
+        }
+    });
     document.getElementById('psy_initializer_debug_close')?.addEventListener('click',()=>{
         const el=document.getElementById('psy_initializer_debug_wrap');
         if (el) el.style.display='none';
@@ -1653,6 +1706,8 @@ function buildSettingsUi() {
         catch(err){
             const state = getState();
             if (err?.initializerParsed) state.runtime.lastInitializerParsed = err.initializerParsed;
+            if (err?.backgroundDebug) state.runtime.lastBackgroundDebug = err.backgroundDebug;
+            else if (lastBackgroundDebug) state.runtime.lastBackgroundDebug = structuredClone(lastBackgroundDebug);
             state.runtime.lastInitializerError = String(err?.message ?? err);
             saveState();
             renderInitializerDebug();

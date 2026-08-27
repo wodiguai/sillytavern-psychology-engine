@@ -78,7 +78,7 @@ function nowIso() { return new Date().toISOString(); }
 
 function newState() {
     return {
-        schemaVersion: '0.2.5',
+        schemaVersion: '0.2.6',
         characters: {},
         relations: {},
         events: {},
@@ -105,6 +105,16 @@ function getState() {
     s.knowledge ??= {};
     s.storyTime ??= { label:'', elapsed:'', confidence:'low' };
     s.runtime ??= { lastAnalyzedMessageId:null, lastAnalyzedAt:null, analyzerErrors:[] };
+
+    // v0.2.6 migration: reject legacy fake-success profiles made entirely from fallback 0.5.
+    for (const ch of Object.values(s.characters ?? {})) {
+        if (ch?.profileStatus === 'confirmed' && isSuspiciousDefaultProfile(ch?.psychologyProfile)) {
+            ch.legacyPsychologyProfile = ch.psychologyProfile;
+            ch.psychologyProfile = null;
+            ch.profileStatus = 'uninitialized';
+        }
+    }
+
     return s;
 }
 
@@ -749,12 +759,129 @@ function normalizeCompactRelation(target, evidence, values, characterName) {
     return rel;
 }
 
+
+function unwrapInitializerResult(raw) {
+    if (!raw || typeof raw !== 'object') return raw;
+
+    const candidates = [
+        raw,
+        raw.profile,
+        raw.data,
+        raw.result,
+        raw.psychologyProfile,
+        raw.output,
+    ];
+
+    for (const c of candidates) {
+        if (!c || typeof c !== 'object') continue;
+        if (
+            c.personalityControl ||
+            c.styleTraits ||
+            c.initialRelationToUser ||
+            c.initialRelations ||
+            c.evidenceSummary
+        ) return c;
+    }
+
+    return raw;
+}
+
+function countPresent(obj, keys) {
+    if (!obj || typeof obj !== 'object') return 0;
+    return keys.filter(k =>
+        obj[k] !== undefined &&
+        obj[k] !== null &&
+        Number.isFinite(Number(obj[k]))
+    ).length;
+}
+
+function isSuspiciousDefaultProfile(profile) {
+    if (!profile) return false;
+
+    const pcVals = PERSONALITY_CONTROL.map(k => profile?.personalityControl?.[k]);
+    const styleKeys = [
+        'warmth','sociability','romanticExpressiveness','jealousyProneness',
+        'dependencyProneness','angerProneness','fearProneness','shameProneness',
+        'curiosityProneness','disgustSensitivity','respectSensitivity'
+    ];
+    const stVals = styleKeys.map(k => profile?.styleTraits?.[k]);
+
+    const allPcHalf = pcVals.length && pcVals.every(v => Number(v) === 0.5);
+    const allStyleHalf = stVals.length && stVals.every(v => Number(v) === 0.5);
+    const noEvidence = !(profile?.evidenceSummary?.length);
+    const noInitializedRelation = !(
+        profile?.initialRelations?.some(r =>
+            r?.status === 'initialized' &&
+            (Object.keys(r?.core ?? {}).length || Object.keys(r?.derived ?? {}).length)
+        )
+    );
+
+    return allPcHalf && allStyleHalf && noEvidence && noInitializedRelation;
+}
+
+function validateInitializerRaw(raw) {
+    const x = unwrapInitializerResult(raw);
+    const styleKeys = [
+        'warmth','sociability','romanticExpressiveness','jealousyProneness',
+        'dependencyProneness','angerProneness','fearProneness','shameProneness',
+        'curiosityProneness','disgustSensitivity','respectSensitivity'
+    ];
+
+    const pcCount = countPresent(x?.personalityControl, PERSONALITY_CONTROL);
+    const styleCount = countPresent(x?.styleTraits, styleKeys);
+    const evidenceCount = Array.isArray(x?.evidenceSummary) ? x.evidenceSummary.length : 0;
+
+    const problems = [];
+
+    if (pcCount < 5) {
+        problems.push(`personalityControl 仅识别到 ${pcCount}/7 项`);
+    }
+    if (styleCount < 7) {
+        problems.push(`styleTraits 仅识别到 ${styleCount}/11 项`);
+    }
+    if (evidenceCount < 1) {
+        problems.push('evidenceSummary 为空');
+    }
+
+    if (problems.length) {
+        const err = new Error(`角色初始化结果不完整：${problems.join('；')}`);
+        err.initializerParsed = x;
+        throw err;
+    }
+
+    return x;
+}
+
+function normalizeLegacyRelationInput(raw, userName) {
+    // Preferred v0.2.4+ compact shape
+    if (raw?.initialRelationToUser) return raw.initialRelationToUser;
+
+    // Older shape: initialRelations: [{target, core, derived, evidence}]
+    const old = Array.isArray(raw?.initialRelations)
+        ? raw.initialRelations.find(r => normName(r?.target) === normName(userName)) || raw.initialRelations[0]
+        : null;
+
+    if (!old) return null;
+
+    return {
+        target: old.target || userName,
+        evidence: old.evidence || [],
+        values: {
+            ...(old.core || {}),
+            ...(old.derived || {}),
+        }
+    };
+}
+
 function normalizeProfile(raw) {
+    raw = validateInitializerRaw(raw);
+
     const name = normName(raw?.character || currentCharacterName());
     if (!name) throw new Error('Profile缺少角色名');
 
     const pc = {};
     for (const k of PERSONALITY_CONTROL) {
+        // No silent 0.5 fallback here. Validation guarantees most keys exist.
         pc[k] = clamp01(raw?.personalityControl?.[k] ?? 0.5);
     }
 
@@ -763,13 +890,18 @@ function normalizeProfile(raw) {
         'dependencyProneness','angerProneness','fearProneness','shameProneness',
         'curiosityProneness','disgustSensitivity','respectSensitivity'
     ];
+
     const styleTraits = {};
-    for (const k of traitKeys) styleTraits[k] = clamp01(raw?.styleTraits?.[k] ?? 0.5);
+    for (const k of traitKeys) {
+        styleTraits[k] = clamp01(raw?.styleTraits?.[k] ?? 0.5);
+    }
 
     const profile = {
-        version: '0.2.4',
+        version: '0.2.6',
         character: name,
-        evidenceSummary: Array.isArray(raw?.evidenceSummary) ? raw.evidenceSummary.map(String).slice(0,20) : [],
+        evidenceSummary: Array.isArray(raw?.evidenceSummary)
+            ? raw.evidenceSummary.map(String).filter(Boolean).slice(0,20)
+            : [],
         personalityControl: pc,
         styleTraits,
         coreParameters: {},
@@ -786,25 +918,36 @@ function normalizeProfile(raw) {
         profile.derivedParameters[k] = defaultDerivedParameter(k, pc, styleTraits);
     }
 
+    const relationInput = normalizeLegacyRelationInput(raw, currentUserName());
+
     const userRel = normalizeCompactRelation(
-        raw?.initialRelationToUser?.target || currentUserName(),
-        raw?.initialRelationToUser?.evidence,
-        raw?.initialRelationToUser?.values,
+        relationInput?.target || currentUserName(),
+        relationInput?.evidence,
+        relationInput?.values,
         name
     );
     if (userRel) profile.initialRelations.push(userRel);
 
     for (const r of raw?.otherKnownRelations ?? []) {
-        const rel = normalizeCompactRelation(r?.target, r?.evidence, r?.values, name);
+        const values = r?.values ?? {
+            ...(r?.core || {}),
+            ...(r?.derived || {}),
+        };
+        const rel = normalizeCompactRelation(r?.target, r?.evidence, values, name);
         if (rel) profile.otherKnownRelations.push(rel);
     }
 
-    // Always preserve the semantic difference between "unknown" and neutral.
     const user = currentUserName();
     if (user && ![...profile.initialRelations, ...profile.otherKnownRelations].some(r => r.target === user)) {
         profile.initialRelations.push({
             target:user, status:'uninitialized', evidence:[], core:{}, derived:{}
         });
+    }
+
+    if (isSuspiciousDefaultProfile(profile)) {
+        const err = new Error('初始化结果疑似全部使用默认0.5兜底，已拒绝写入。请查看原始AI输出后重试。');
+        err.initializerParsed = raw;
+        throw err;
     }
 
     return profile;
@@ -824,6 +967,15 @@ async function generateCharacterProfile() {
     });
 
     const parsed = await parseModelJson(raw, 'character profile initialization');
+
+    const state = getState();
+    state.runtime.lastInitializerRaw = typeof raw === 'string'
+        ? raw
+        : JSON.stringify(raw, null, 2);
+    state.runtime.lastInitializerParsed = parsed;
+    state.runtime.lastInitializerAt = nowIso();
+    saveState();
+
     pendingProfile = normalizeProfile(parsed);
     showProfilePreview(pendingProfile);
     updateStatus('等待确认初始化');
@@ -898,6 +1050,21 @@ function confirmProfileFromTextarea() {
     } catch (err) {
         toast('error', `Profile JSON无效：${err?.message ?? err}`);
     }
+}
+
+function renderInitializerDebug() {
+    const wrap = document.getElementById('psy_initializer_debug_wrap');
+    const rawBox = document.getElementById('psy_initializer_raw');
+    const parsedBox = document.getElementById('psy_initializer_parsed');
+    if (!wrap || !rawBox || !parsedBox) return;
+
+    const rt = getState()?.runtime ?? {};
+    rawBox.value = String(rt.lastInitializerRaw ?? '');
+    parsedBox.value = rt.lastInitializerParsed
+        ? JSON.stringify(rt.lastInitializerParsed, null, 2)
+        : '';
+
+    wrap.style.display = 'block';
 }
 
 function renderInitializerStatus() {
@@ -1303,8 +1470,23 @@ function buildSettingsUi() {
         <h4>角色初始化</h4>
         <div id="psy_initializer_status"></div>
         <div class="psy-buttons">
+          <button id="psy_show_init_raw" class="menu_button">查看初始化原始输出</button>
           <button id="psy_init_ai" class="menu_button">AI分析当前角色卡</button>
           <button id="psy_show_profile" class="menu_button">查看已确认Profile</button>
+        </div>
+
+        <div id="psy_initializer_debug_wrap" class="psy-profile-preview" style="display:none">
+          <div class="psy-profile-title">Initializer Debug</div>
+          <p class="psy-help">下面显示模型原始返回和插件解析后的高层JSON，用于定位schema问题。</p>
+          <label>Raw Output
+            <textarea id="psy_initializer_raw" class="text_pole" rows="8" readonly></textarea>
+          </label>
+          <label>Parsed Output
+            <textarea id="psy_initializer_parsed" class="text_pole" rows="8" readonly></textarea>
+          </label>
+          <div class="psy-buttons">
+            <button id="psy_initializer_debug_close" class="menu_button">关闭</button>
+          </div>
         </div>
 
         <div id="psy_profile_preview_wrap" class="psy-profile-preview" style="display:none">
@@ -1356,9 +1538,25 @@ function buildSettingsUi() {
     bindSetting('psy_depth','injectionDepth','number');
     bindSetting('psy_extra','analyzerPromptExtra','text');
 
+    document.getElementById('psy_show_init_raw')?.addEventListener('click',()=>{
+        renderInitializerDebug();
+    });
+    document.getElementById('psy_initializer_debug_close')?.addEventListener('click',()=>{
+        const el=document.getElementById('psy_initializer_debug_wrap');
+        if (el) el.style.display='none';
+    });
+
     document.getElementById('psy_init_ai')?.addEventListener('click',async()=>{
         try { await generateCharacterProfile(); }
-        catch(err){ toast('error',`初始化分析失败：${err?.message??err}`); updateStatus('初始化失败'); }
+        catch(err){
+            const state = getState();
+            if (err?.initializerParsed) state.runtime.lastInitializerParsed = err.initializerParsed;
+            state.runtime.lastInitializerError = String(err?.message ?? err);
+            saveState();
+            renderInitializerDebug();
+            toast('error',`初始化分析失败：${err?.message??err}`);
+            updateStatus('初始化失败');
+        }
     });
     document.getElementById('psy_show_profile')?.addEventListener('click',()=>{
         const name=currentCharacterName();

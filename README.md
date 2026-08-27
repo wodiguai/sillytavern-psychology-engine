@@ -1,5 +1,23 @@
 
-### v0.2.5：后台调用改用 generateRaw()
+### v0.2.6：严格初始化校验与原始输出调试
+
+修复“AI没有真正分析角色卡，但插件用默认0.5填满所有人格参数后仍显示初始化成功”的问题。
+
+现在：
+
+- personalityControl 至少需要 5/7 个有效字段；
+- styleTraits 至少需要 7/11 个有效字段；
+- evidenceSummary 至少需要 1 条；
+- 如果最终Profile表现为“全部0.5 + 无证据 + 无初始关系”，初始化直接失败；
+- 不再允许这种fallback模板被确认成真实角色Profile；
+- 新增“查看初始化原始输出”按钮；
+- 保存 Raw Output 与 Parsed Output；
+- 自动把旧版可疑全0.5 Profile 标记回 uninitialized；
+- 内部 schemaVersion / profile.version 同步升级到 0.2.6。
+
+
+
+### v0.2.6 — Strict Profile Validation
 
 `generateQuietPrompt()` 即使 `skipWIAN:true` 仍属于聊天生成链路；`skipWIAN` 只跳过 World Info / Author's Note，并不等于完全隔离主提示词和角色上下文。
 

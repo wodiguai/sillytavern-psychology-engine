@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Psychology Engine v0.2 per-chat state",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "characters",
+    "relations",
+    "events",
+    "knowledge",
+    "runtime"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "string"
+    },
+    "characters": {
+      "type": "object"
+    },
+    "relations": {
+      "type": "object"
+    },
+    "events": {
+      "type": "object"
+    },
+    "knowledge": {
+      "type": "object"
+    },
+    "runtime": {
+      "type": "object"
+    }
+  }
+}

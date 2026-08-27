@@ -1,0 +1,16 @@
+{
+  "display_name": "Psychology Engine",
+  "loading_order": 80,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "OpenAI / XuYan collaborative design",
+  "version": "0.2.0",
+  "homePage": "https://github.com/YOUR_GITHUB_USERNAME/sillytavern-psychology-engine",
+  "auto_update": true,
+  "minimum_client_version": "1.14.0",
+  "hooks": {
+    "activate": "init"
+  }
+}

@@ -1,0 +1,33 @@
+
+#psychology_engine_settings .inline-drawer-content { display:none; padding:.75rem; }
+#psychology_engine_settings .inline-drawer-content.open { display:block; }
+#psychology_engine_settings label { display:block; margin:.4rem 0; }
+#psychology_engine_settings textarea { width:100%; box-sizing:border-box; font-family:monospace; }
+#psychology_engine_settings .psy-buttons { display:flex; flex-wrap:wrap; gap:.4rem; margin:.65rem 0; }
+#psychology_engine_settings .psy-file-label { cursor:pointer; }
+#psychology_engine_settings .psy-status { opacity:.8; margin:.5rem 0; }
+#psychology_engine_settings .psy-empty { opacity:.7; padding:.5rem 0; }
+#psychology_engine_settings .psy-edge {
+    border-top:1px solid var(--SmartThemeBorderColor,#7774);
+    padding:.45rem 0;
+}
+#psychology_engine_settings .psy-edge summary { cursor:pointer; font-weight:600; }
+#psychology_engine_settings .psy-grid {
+    display:grid; grid-template-columns:repeat(2,minmax(0,1fr));
+    gap:.2rem .6rem; margin-top:.4rem; font-size:.92em;
+}
+#psychology_engine_settings .psy-derived { opacity:.88; }
+#psychology_engine_settings .psy-profile-preview {
+    border:1px solid var(--SmartThemeBorderColor,#7776);
+    border-radius:8px; padding:.7rem; margin:.7rem 0;
+}
+#psychology_engine_settings .psy-profile-title { font-weight:700; margin-bottom:.35rem; }
+#psychology_engine_settings .psy-help { opacity:.75; font-size:.9em; }
+#psychology_engine_settings .psy-ok { color:#74c991; }
+#psychology_engine_settings .psy-warn { color:#e2b96f; }
+#psychology_engine_settings .psy-uninit {
+    font-size:.8em; opacity:.7; margin-left:.4em;
+}
+@media(min-width:900px){
+  #psychology_engine_settings .psy-grid { grid-template-columns:repeat(3,minmax(0,1fr)); }
+}

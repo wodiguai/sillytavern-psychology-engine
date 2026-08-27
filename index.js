@@ -78,7 +78,7 @@ function nowIso() { return new Date().toISOString(); }
 
 function newState() {
     return {
-        schemaVersion: '0.2.9',
+        schemaVersion: '0.2.10',
         characters: {},
         relations: {},
         events: {},
@@ -518,7 +518,7 @@ ${JSON.stringify(card, null, 2)}
 `.trim();
 }
 
-function initializerRelationPrompt(personalityResult) {
+function initializerRelationPrompt(personalityResult, retryContext = null) {
     const card = extractCardForInitializer();
 
     return `
@@ -526,6 +526,36 @@ Analyze ONLY the initial directed relationship:
 ${card.name} -> ${card.userName}
 
 Use the character card and the already-analyzed personality below.
+
+IMPORTANT SCALE:
+All values use the full [-100,100] intensity scale.
+
+-100 = extreme negative
+-75  = strong negative
+-50  = clear negative
+-25  = mild negative
+0    = genuinely neutral
++25  = mild positive
++50  = clear/moderate positive
++75  = strong positive
++90  = very strong
++100 = theoretical extreme
+
+CRITICAL:
+1 is NOT "true".
+1 means almost neutral.
+Do NOT use 1 simply to indicate that a feeling exists.
+Use null when the card does not provide enough evidence.
+
+Example:
+{
+  "Love": 75,
+  "Trust": 65,
+  "Respect": 70,
+  "Curiosity": 20,
+  "Anger": 0,
+  "Dependency": null
+}
 
 Return this exact shape:
 {
@@ -565,10 +595,20 @@ Return this exact shape:
 Rules:
 - null = insufficient information.
 - 0 = genuinely neutral.
+- Values represent INTENSITY, not boolean presence.
 - Love != Attraction != Admiration != Respect.
 - Do not assume romance because the user is the protagonist.
-- If the card explicitly states spouse/lover/enemy/stranger/etc., use that history.
-- Omit unsupported guesses by leaving them null.
+- Do not convert "exists" into value 1.
+- Use only card-supported evidence.
+
+${retryContext ? `
+The previous output was rejected because it looked like a boolean 0/1 encoding.
+Re-evaluate from scratch using the numeric anchors above.
+Do NOT preserve the previous 0/1 values.
+
+Rejected output:
+${JSON.stringify(retryContext, null, 2)}
+` : ''}
 
 PERSONALITY ANALYSIS:
 ${JSON.stringify(personalityResult, null, 2)}
@@ -827,6 +867,31 @@ function defaultDerivedParameter(variable, pc, traits) {
     };
 }
 
+
+function detectBinaryCollapse(values) {
+    if (!values || typeof values !== 'object') {
+        return { collapsed: false, numericCount: 0, binaryLikeCount: 0, ratio: 0 };
+    }
+
+    const nums = Object.values(values)
+        .filter(v => v !== null && v !== undefined && Number.isFinite(Number(v)))
+        .map(Number);
+
+    if (nums.length < 8) {
+        return { collapsed: false, numericCount: nums.length, binaryLikeCount: 0, ratio: 0 };
+    }
+
+    const binaryLikeCount = nums.filter(v => v === -1 || v === 0 || v === 1).length;
+    const ratio = binaryLikeCount / nums.length;
+
+    return {
+        collapsed: ratio >= 0.70,
+        numericCount: nums.length,
+        binaryLikeCount,
+        ratio,
+    };
+}
+
 function normalizeCompactRelation(target, evidence, values, characterName) {
     target = normName(target);
     if (!target || target === characterName) return null;
@@ -989,7 +1054,7 @@ function normalizeProfile(raw) {
     }
 
     const profile = {
-        version: '0.2.9',
+        version: '0.2.10',
         character: name,
         evidenceSummary: Array.isArray(raw?.evidenceSummary)
             ? raw.evidenceSummary.map(String).filter(Boolean).slice(0,20)
@@ -1086,16 +1151,49 @@ async function generateCharacterProfile() {
 
     updateStatus('步骤2/2：分析初始关系…');
 
-    const rawRelation = await generateBackgroundQuiet({
+    let rawRelation = await generateBackgroundQuiet({
         prompt: initializerRelationPrompt(personality),
         purpose: 'Return a small JSON object describing the initial directed relationship from character to user.',
         responseLength: 2048,
     });
 
-    const relation = await parseModelJson(
+    let relation = await parseModelJson(
         rawRelation,
         'character initial relationship'
     );
+
+    let collapse = detectBinaryCollapse(relation?.values);
+
+    if (collapse.collapsed) {
+        updateStatus('步骤2/2：检测到0/1量表误读，正在重试…');
+
+        const rejectedRelation = relation;
+
+        rawRelation = await generateBackgroundQuiet({
+            prompt: initializerRelationPrompt(personality, rejectedRelation),
+            purpose: 'Re-analyze the initial directed relationship using the full [-100,100] intensity scale. Previous output incorrectly used 0/1 as boolean flags.',
+            responseLength: 2048,
+        });
+
+        relation = await parseModelJson(
+            rawRelation,
+            'character initial relationship retry'
+        );
+
+        collapse = detectBinaryCollapse(relation?.values);
+
+        if (collapse.collapsed) {
+            const err = new Error(
+                `初始关系疑似仍被模型写成0/1布尔量表：${collapse.binaryLikeCount}/${collapse.numericCount} 个非空数值为 -1/0/1。`
+            );
+            err.initializerParsed = {
+                personality,
+                relation,
+                binaryCollapse: collapse,
+            };
+            throw err;
+        }
+    }
 
     const combined = {
         character: personality.character || currentCharacterName(),

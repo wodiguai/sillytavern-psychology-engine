@@ -1,5 +1,36 @@
 
-### v0.2.6：严格初始化校验与原始输出调试
+### v0.2.7：修复 jsonSchema 返回 `{}` 的兼容问题
+
+部分 API / 模型连接不会对 `jsonSchema` 抛错，而是直接返回：
+
+```json
+{}
+```
+
+旧版会把 `{}` 当作“结构化调用成功”，因此后续 Profile 只能全部进入默认值。
+
+v0.2.7 现在会同时检查：
+
+```text
+1. generateRaw 是否抛异常
+2. 返回是否为空：{} / [] / null / 空字符串
+3. 返回是否具备初始化器 / 状态分析器所需的关键结构
+```
+
+只要任一检查失败：
+
+```text
+自动移除 jsonSchema
+→ 使用同一个隔离 systemPrompt
+→ 再调用一次普通 generateRaw()
+→ 要求仅输出严格 JSON
+```
+
+因此某些“不支持或伪支持 structured output”的模型/API也可以正常工作。
+
+
+
+### v0.2.7 — Structured Output Semantic Fallback
 
 修复“AI没有真正分析角色卡，但插件用默认0.5填满所有人格参数后仍显示初始化成功”的问题。
 

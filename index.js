@@ -78,7 +78,7 @@ function nowIso() { return new Date().toISOString(); }
 
 function newState() {
     return {
-        schemaVersion: '0.2.6',
+        schemaVersion: '0.2.7',
         characters: {},
         relations: {},
         events: {},
@@ -294,11 +294,73 @@ Return machine-readable output exactly as requested.
 `.trim();
 }
 
-async function generateBackgroundRaw({ prompt, purpose, responseLength = 4096, jsonSchema = null }) {
+
+function looksLikeEmptyStructuredOutput(raw) {
+    if (raw === null || raw === undefined) return true;
+
+    if (typeof raw === 'object') {
+        if (Array.isArray(raw)) return raw.length === 0;
+        return Object.keys(raw).length === 0;
+    }
+
+    const s = String(raw).trim();
+    if (!s) return true;
+    if (s === '{}' || s === '[]' || s === 'null') return true;
+
+    try {
+        const parsed = JSON.parse(s);
+        if (parsed && typeof parsed === 'object') {
+            if (Array.isArray(parsed)) return parsed.length === 0;
+            return Object.keys(parsed).length === 0;
+        }
+    } catch (_) {}
+
+    return false;
+}
+
+function hasInitializerShape(raw) {
+    try {
+        const parsed = typeof raw === 'string' ? parseJsonTolerant(raw) : raw;
+        if (!parsed || typeof parsed !== 'object') return false;
+        return Boolean(
+            parsed.character ||
+            parsed.personalityControl ||
+            parsed.styleTraits ||
+            parsed.initialRelationToUser ||
+            parsed.initialRelations ||
+            parsed.profile ||
+            parsed.data ||
+            parsed.result
+        );
+    } catch (_) {
+        return false;
+    }
+}
+
+function hasAnalyzerShape(raw) {
+    try {
+        const parsed = typeof raw === 'string' ? parseJsonTolerant(raw) : raw;
+        if (!parsed || typeof parsed !== 'object') return false;
+        return Array.isArray(parsed.events)
+            || Array.isArray(parsed.knowledge)
+            || Array.isArray(parsed.updates)
+            || parsed.storyTime !== undefined;
+    } catch (_) {
+        return false;
+    }
+}
+
+async function generateBackgroundRaw({
+    prompt,
+    purpose,
+    responseLength = 4096,
+    jsonSchema = null,
+    validateShape = null,
+}) {
     const c = ctx();
     if (!c?.generateRaw) throw new Error('当前 SillyTavern 上下文不支持 generateRaw()');
 
-    const options = {
+    const baseOptions = {
         prompt,
         systemPrompt: backgroundSystemPrompt(purpose),
         responseLength,
@@ -306,16 +368,50 @@ async function generateBackgroundRaw({ prompt, purpose, responseLength = 4096, j
         quietToLoud: false,
     };
 
-    if (jsonSchema) options.jsonSchema = jsonSchema;
+    // First attempt: structured output if requested.
+    if (jsonSchema) {
+        try {
+            const structured = await c.generateRaw({
+                ...baseOptions,
+                jsonSchema,
+            });
 
-    try {
-        return await c.generateRaw(options);
-    } catch (err) {
-        if (!jsonSchema) throw err;
-        console.warn('[Psychology Engine] structured raw generation failed; retrying without jsonSchema', err);
-        delete options.jsonSchema;
-        return await c.generateRaw(options);
+            const semanticallyEmpty = looksLikeEmptyStructuredOutput(structured);
+            const shapeInvalid = typeof validateShape === 'function'
+                ? !validateShape(structured)
+                : false;
+
+            if (!semanticallyEmpty && !shapeInvalid) {
+                return structured;
+            }
+
+            console.warn(
+                '[Psychology Engine] structured output returned empty/invalid shape; retrying without jsonSchema',
+                structured
+            );
+        } catch (err) {
+            console.warn(
+                '[Psychology Engine] structured raw generation failed; retrying without jsonSchema',
+                err
+            );
+        }
     }
+
+    // Second attempt: plain raw generation, fully isolated from RP context.
+    const plainPrompt = `
+${prompt}
+
+FINAL OUTPUT REQUIREMENT:
+Return ONLY one strict JSON object.
+Do not use markdown fences.
+Do not prepend or append explanations.
+Do not return an empty object unless the requested schema explicitly permits it.
+`.trim();
+
+    return await c.generateRaw({
+        ...baseOptions,
+        prompt: plainPrompt,
+    });
 }
 
 function initializerJsonSchema() {
@@ -598,7 +694,11 @@ ${String(rawText ?? '').slice(0, 24000)}
 
 async function parseModelJson(text, purpose = 'state analysis') {
     try {
-        return parseJsonTolerant(text);
+        const parsed = parseJsonTolerant(text);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && Object.keys(parsed).length === 0) {
+            throw new Error('模型返回了空JSON对象 {}');
+        }
+        return parsed;
     } catch (firstError) {
         console.warn('[Psychology Engine] local JSON parse failed; trying repair pass', firstError);
         const repaired = await repairJsonWithModel(text, purpose);
@@ -897,7 +997,7 @@ function normalizeProfile(raw) {
     }
 
     const profile = {
-        version: '0.2.6',
+        version: '0.2.7',
         character: name,
         evidenceSummary: Array.isArray(raw?.evidenceSummary)
             ? raw.evidenceSummary.map(String).filter(Boolean).slice(0,20)
@@ -964,6 +1064,7 @@ async function generateCharacterProfile() {
         purpose: 'analyze a character card and return a compact Psychology Profile JSON',
         responseLength: 4096,
         jsonSchema: initializerJsonSchema(),
+        validateShape: hasInitializerShape,
     });
 
     const parsed = await parseModelJson(raw, 'character profile initialization');
@@ -1373,6 +1474,7 @@ async function analyzeNow({force=false}={}) {
             purpose: 'analyze recent roleplay events and return Psychology Engine event/knowledge/update JSON',
             responseLength: 4096,
             jsonSchema: analyzerJsonSchema(),
+            validateShape: hasAnalyzerShape,
         });
         const result=await parseModelJson(raw, 'state analysis');
         applyAnalysis(result);

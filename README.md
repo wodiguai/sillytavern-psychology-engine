@@ -1,8 +1,31 @@
 # SillyTavern Psychology Engine
 
-## v0.2.0 — Character Profile Initializer
+## v0.2.1 — Character Profile Initializer + World Info Fix
 
 一个前端-only 的 SillyTavern 扩展，用于维护任意角色之间的 **有向心理关系状态**：
+
+
+### v0.2.1 World Info 修正
+
+配套心理世界书已经转换为 **SillyTavern 原生 World Info JSON**。
+
+仓库中的文件：
+
+```text
+PsychologyEngine-WorldInfo-SillyTavern-v1.4.json
+```
+
+导入方式：
+
+```text
+SillyTavern → World Info → Import
+```
+
+不要再导入旧的 `lorebook_v3` 包装文件；该格式会在 SillyTavern 中出现：
+
+```text
+Failed to import World Info
+```
 
 ```text
 A → B != B → A
@@ -205,3 +228,20 @@ v0.3 优先做：
 ## License
 
 MIT
+
+
+---
+
+## 插件与 World Info 的分工
+
+```text
+World Info
+= 心理变量定义 / Knowledge Gate / 派生状态 / 更新 / 输出与记录规则
+
+Psychology Engine Extension
+= 角色初始化 / 动态状态 / Event / Knowledge / 有向关系数据库 / Prompt 注入
+```
+
+插件安装和 World Info 导入是两件独立操作：
+1. GitHub URL 安装 Extension。
+2. 从仓库下载 `PsychologyEngine-WorldInfo-SillyTavern-v1.4.json` 后，在 World Info 页面导入。

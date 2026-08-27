@@ -1,5 +1,30 @@
 
-### v0.2.8：默认禁用 Structured Output
+### v0.2.9：回到兼容性更好的 quiet generation
+
+当前连接实测：
+- `generateQuietPrompt()` 可以正常生成；
+- `generateRaw()` 报 `No message generated`。
+
+因此 v0.2.9 不再使用 `generateRaw()`。
+
+角色初始化拆成两个短调用：
+
+```text
+步骤1：人格参数 JSON
+步骤2：角色 → user 初始关系 JSON
+```
+
+每次输出都很小，降低 JSON 截断和被 RP 上下文带偏的概率。
+
+状态分析和 JSON 修复也统一回到：
+```text
+generateQuietPrompt(..., skipWIAN:true)
+```
+
+这是目前针对不同 SillyTavern API/provider 兼容性的务实方案。
+
+
+### v0.2.9 — Quiet-Compatible Split Initializer
 
 确认一个插件实现错误：SillyTavern 的 `jsonSchema` 需要包装为：
 

@@ -1,5 +1,48 @@
 
-### v0.2.4 关键修正
+### v0.2.5：后台调用改用 generateRaw()
+
+`generateQuietPrompt()` 即使 `skipWIAN:true` 仍属于聊天生成链路；`skipWIAN` 只跳过 World Info / Author's Note，并不等于完全隔离主提示词和角色上下文。
+
+当后台 JSON 中出现：
+
+```text
+<!-- 1.正文前 ... -->
+```
+
+说明后台调用仍被 RP Prompt Manager 内容污染。
+
+v0.2.5 将三类后台任务全部迁移至：
+
+```text
+generateRaw({
+  prompt,
+  systemPrompt,
+  responseLength,
+  jsonSchema
+})
+```
+
+包括：
+
+- Character Initializer
+- State Analyzer
+- JSON Repair
+
+插件优先尝试 `jsonSchema` 结构化输出；若当前模型/API不支持，自动回退到普通 `generateRaw()`，再使用本地宽松 JSON 解析器。
+
+现在：
+
+```text
+普通 RP
+→ SillyTavern 正常聊天生成链路
+
+Psychology Engine
+→ 独立 raw generation
+```
+
+
+
+### v0.2.5 — Raw Background Generation
 
 #### 1. Character Initializer 瘦身
 旧版要求模型一次生成完整 18×参数表，输出过大且容易产生无效 JSON。

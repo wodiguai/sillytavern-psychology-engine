@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Psychology Engine v0.2 per-chat state",
+  "title": "Psychology Engine v0.3 per-chat state",
   "type": "object",
   "required": [
     "schemaVersion",
@@ -12,7 +12,7 @@
   ],
   "properties": {
     "schemaVersion": {
-      "type": "string"
+      "const": "0.3.0"
     },
     "characters": {
       "type": "object"

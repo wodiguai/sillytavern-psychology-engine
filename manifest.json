@@ -6,8 +6,8 @@
   "js": "index.js",
   "css": "style.css",
   "author": "OpenAI / XuYan collaborative design",
-  "version": "0.2.10",
-  "homePage": "https://github.com/YOUR_GITHUB_USERNAME/sillytavern-psychology-engine",
+  "version": "0.3.0",
+  "homePage": "https://github.com/wodiguai/sillytavern-psychology-engine",
   "auto_update": true,
   "minimum_client_version": "1.14.0",
   "hooks": {

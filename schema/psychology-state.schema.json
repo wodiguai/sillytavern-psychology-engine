@@ -1,9 +1,11 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Psychology Engine v0.3 per-chat state",
+  "title": "Psychology Engine v0.3.3 actor eligibility per-chat state",
   "type": "object",
   "required": [
     "schemaVersion",
+    "cardContexts",
+    "actorRegistry",
     "characters",
     "relations",
     "events",
@@ -12,7 +14,7 @@
   ],
   "properties": {
     "schemaVersion": {
-      "const": "0.3.0"
+      "const": "0.3.3"
     },
     "characters": {
       "type": "object"
@@ -27,6 +29,12 @@
       "type": "object"
     },
     "runtime": {
+      "type": "object"
+    },
+    "cardContexts": {
+      "type": "object"
+    },
+    "actorRegistry": {
       "type": "object"
     }
   }

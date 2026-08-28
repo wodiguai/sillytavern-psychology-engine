@@ -1,6 +1,6 @@
 /**
  * Psychology Engine for SillyTavern
- * v0.3.0 — Single-pass Architecture
+ * v0.3.3 — Actor Eligibility Gate
  *
  * No secondary LLM call.
  *
@@ -63,6 +63,7 @@ const DEFAULT_SETTINGS = {
 };
 
 let initialized = false;
+let generationActive = false;
 
 function ctx() {
     return window.SillyTavern?.getContext?.();
@@ -74,6 +75,30 @@ function nowIso() {
 
 function clone(x) {
     return x === undefined ? undefined : structuredClone(x);
+}
+
+function fastFingerprint(text) {
+    const s = String(text ?? '');
+    let h = 2166136261;
+    for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+    }
+    return `${s.length}:${(h >>> 0).toString(16)}`;
+}
+
+function latestAssistantMessageId() {
+    const chat = ctx()?.chat ?? [];
+    for (let i = chat.length - 1; i >= 0; i--) {
+        const m = chat[i];
+        if (m && !m.is_user && !m.is_system) return i;
+    }
+    return -1;
+}
+
+function currentSwipeKey(msg) {
+    const id = Number(msg?.swipe_id);
+    return Number.isFinite(id) ? String(id) : '0';
 }
 
 function toast(type, message) {
@@ -101,7 +126,9 @@ function saveSettings() {
 
 function newState() {
     return {
-        schemaVersion: '0.3.0',
+        schemaVersion: '0.3.3',
+        cardContexts: {},
+        actorRegistry: {},
         characters: {},
         relations: {},
         events: {},
@@ -125,7 +152,9 @@ function getState() {
     if (!c.chatMetadata[METADATA_KEY]) c.chatMetadata[METADATA_KEY] = newState();
     const s = c.chatMetadata[METADATA_KEY];
 
-    s.schemaVersion = '0.3.0';
+    s.schemaVersion = '0.3.3';
+    s.cardContexts ??= {};
+    s.actorRegistry ??= {};
     s.characters ??= {};
     s.relations ??= {};
     s.events ??= {};
@@ -138,6 +167,7 @@ function getState() {
     s.runtime.lastControlParsed ??= null;
     s.runtime.lastControlError ??= null;
     s.runtime.initRetryReason ??= null;
+    s.runtime.lastRollback ??= null;
 
     return s;
 }
@@ -175,6 +205,158 @@ function currentCharacterName() {
 
 function currentUserName() {
     return normName(ctx()?.name1 || 'user');
+}
+
+function ensureCardContext(cardName) {
+    cardName = normName(cardName);
+    if (!cardName) return null;
+
+    const s = getState();
+    s.cardContexts[cardName] ??= {
+        name: cardName,
+        isContainer: null,
+        actorNames: [],
+        updatedAt: null,
+    };
+    return s.cardContexts[cardName];
+}
+
+function isContainerName(name) {
+    name = normName(name);
+    if (!name) return false;
+    return getState().cardContexts?.[name]?.isContainer === true;
+}
+
+function registerActor(name, source, evidence = '', sourceCard = '') {
+    name = normName(name);
+    source = String(source ?? '').trim();
+    if (!name || !['character_card','world_info'].includes(source)) return null;
+    if (isContainerName(name)) return null;
+
+    const s = getState();
+    s.actorRegistry[name] = {
+        name,
+        source,
+        evidence: String(evidence ?? '').trim().slice(0, 600),
+        sourceCard: normName(sourceCard),
+        persistent: true,
+        registeredAt: s.actorRegistry[name]?.registeredAt ?? nowIso(),
+        updatedAt: nowIso(),
+    };
+    return s.actorRegistry[name];
+}
+
+function isEligibleActor(name) {
+    name = normName(name);
+    if (!name || isContainerName(name)) return false;
+    return Boolean(getState().actorRegistry?.[name]?.persistent === true);
+}
+
+function eligibleActorNames() {
+    return Object.values(getState().actorRegistry ?? {})
+        .filter(x => x?.persistent === true)
+        .map(x => normName(x.name))
+        .filter(Boolean);
+}
+
+function actorRegistryForPrompt() {
+    return eligibleActorNames().map(name => {
+        const reg = getState().actorRegistry[name];
+        return {
+            name,
+            source: reg.source,
+            sourceCard: reg.sourceCard || undefined,
+        };
+    });
+}
+
+function confirmedActorNames() {
+    const user = currentUserName();
+    return Object.values(getState().characters ?? {})
+        .filter(ch =>
+            ch?.profileStatus === 'confirmed' &&
+            ch?.psychologyProfile &&
+            normName(ch.id) !== user &&
+            isEligibleActor(ch.id)
+        )
+        .map(ch => normName(ch.id))
+        .filter(Boolean);
+}
+
+function uninitializedActorNames() {
+    const user = currentUserName();
+    return eligibleActorNames()
+        .filter(name => name !== user)
+        .filter(name => getState().characters?.[name]?.profileStatus !== 'confirmed');
+}
+
+function actorProfilesForPrompt() {
+    const s = getState();
+    return confirmedActorNames().map(name => {
+        const ch = s.characters[name];
+        return {
+            character: name,
+            sourceCards: ch?.sourceCards ?? [],
+            personalityControl: ch?.psychologyProfile?.personalityControl ?? null,
+            styleTraits: ch?.psychologyProfile?.styleTraits ?? null,
+        };
+    });
+}
+
+function purgeContainerIdentity(cardName) {
+    cardName = normName(cardName);
+    if (!cardName) return;
+
+    const s = getState();
+
+    // Remove the old v0.3.x pseudo-character if a card title/container had
+    // previously been mistaken for a psychological actor.
+    delete s.characters[cardName];
+    delete s.knowledge[cardName];
+    delete s.actorRegistry[cardName];
+
+    for (const [key, edge] of Object.entries(s.relations ?? {})) {
+        if (normName(edge?.observer) === cardName || normName(edge?.target) === cardName) {
+            delete s.relations[key];
+        }
+    }
+
+    for (const event of Object.values(s.events ?? {})) {
+        if (Array.isArray(event?.knownBy)) {
+            event.knownBy = event.knownBy.filter(n => normName(n) !== cardName);
+        }
+    }
+}
+
+function needsInitializationForContext(cardName) {
+    const settings = getSettings();
+    if (!settings.autoInitialize) return false;
+
+    cardName = normName(cardName);
+    if (!cardName) return false;
+
+    const s = getState();
+    const context = s.cardContexts?.[cardName];
+
+    // New card context: let the main model decide whether this is a real
+    // single actor card or only a container/title for multiple actors.
+    if (!context) return true;
+
+    // Known single-character card.
+    if (context.isContainer === false) {
+        if (!profileExists(cardName)) return true;
+    }
+
+    // Known container: every registered actor should eventually get a profile.
+    if (context.isContainer === true) {
+        if (!(context.actorNames ?? []).length) return true;
+        if ((context.actorNames ?? []).some(name => !profileExists(name))) return true;
+    }
+
+    // New actors discovered dynamically by PSY_UPDATE need profiles too.
+    if (uninitializedActorNames().length) return true;
+
+    return false;
 }
 
 function ensureCharacter(name) {
@@ -426,14 +608,17 @@ function parseJsonTolerant(text) {
     throw last ?? new Error('invalid JSON');
 }
 
-function profileFromInitPayload(payload, charName, userName) {
-    if (!payload || typeof payload !== 'object') throw new Error('PSY_INIT payload missing');
+function profileFromInitPayload(payload, charName, userName, sourceCard = '') {
+    if (!payload || typeof payload !== 'object') throw new Error('PSY_INIT profile payload missing');
+
+    const actorName = normName(payload.character || charName);
+    if (!actorName) throw new Error('PSY_INIT profile missing character name');
 
     const personalityControl = {};
     for (const k of PERSONALITY_CONTROL) {
         const v = payload?.personalityControl?.[k];
         if (v === undefined || v === null || !Number.isFinite(Number(v))) {
-            throw new Error(`PSY_INIT missing personalityControl.${k}`);
+            throw new Error(`PSY_INIT ${actorName} missing personalityControl.${k}`);
         }
         personalityControl[k] = clamp01(v);
     }
@@ -442,7 +627,7 @@ function profileFromInitPayload(payload, charName, userName) {
     for (const k of STYLE_TRAITS) {
         const v = payload?.styleTraits?.[k];
         if (v === undefined || v === null || !Number.isFinite(Number(v))) {
-            throw new Error(`PSY_INIT missing styleTraits.${k}`);
+            throw new Error(`PSY_INIT ${actorName} missing styleTraits.${k}`);
         }
         styleTraits[k] = clamp01(v);
     }
@@ -451,21 +636,14 @@ function profileFromInitPayload(payload, charName, userName) {
         ? payload.evidenceSummary.map(String).filter(Boolean).slice(0,20)
         : [];
 
-    if (!evidenceSummary.length) throw new Error('PSY_INIT evidenceSummary is empty');
-
-    const values = payload?.initialRelation?.values ?? {};
-    const collapse = detectBinaryCollapse(values);
-    if (collapse.collapsed) {
-        const err = new Error(
-            `PSY_INIT initial relation looks binary: ${collapse.binaryLikeCount}/${collapse.numericCount} values are -1/0/1`
-        );
-        err.binaryCollapse = collapse;
-        throw err;
+    if (!evidenceSummary.length) {
+        throw new Error(`PSY_INIT ${actorName} evidenceSummary is empty`);
     }
 
     const profile = {
-        version: '0.3.0',
-        character: normName(payload.character || charName),
+        version: '0.3.3',
+        character: actorName,
+        sourceCard: normName(sourceCard),
         evidenceSummary,
         personalityControl,
         styleTraits,
@@ -482,32 +660,125 @@ function profileFromInitPayload(payload, charName, userName) {
         profile.derivedParameters[k] = defaultDerivedParameter(k, personalityControl, styleTraits);
     }
 
-    const target = normName(payload?.initialRelation?.target || userName);
-    const rel = {
-        target,
-        status: 'initialized',
-        evidence: Array.isArray(payload?.initialRelation?.evidence)
-            ? payload.initialRelation.evidence.map(String).filter(Boolean).slice(0,12)
-            : [],
-        core: {},
-        derived: {},
-    };
+    const relationInputs = Array.isArray(payload.initialRelations)
+        ? payload.initialRelations
+        : payload.initialRelation
+            ? [payload.initialRelation]
+            : [];
 
-    for (const [k,v] of Object.entries(values)) {
-        if (v === null || v === undefined || !Number.isFinite(Number(v))) continue;
-        if (CORE_VARIABLES.includes(k)) rel.core[k] = clamp100(v);
-        if (DERIVED_VARIABLES.includes(k)) rel.derived[k] = clamp100(v);
+    for (const relationInput of relationInputs.slice(0, 8)) {
+        const target = normName(relationInput?.target || '');
+        if (!target || target === actorName) continue;
+
+        const values = relationInput?.values ?? {};
+        const collapse = detectBinaryCollapse(values);
+        if (collapse.collapsed) {
+            const err = new Error(
+                `PSY_INIT ${actorName}→${target} looks binary: ` +
+                `${collapse.binaryLikeCount}/${collapse.numericCount} values are -1/0/1`
+            );
+            err.binaryCollapse = collapse;
+            throw err;
+        }
+
+        const rel = {
+            target,
+            status: 'initialized',
+            evidence: Array.isArray(relationInput?.evidence)
+                ? relationInput.evidence.map(String).filter(Boolean).slice(0,12)
+                : [],
+            core: {},
+            derived: {},
+        };
+
+        for (const [k,v] of Object.entries(values)) {
+            if (v === null || v === undefined || !Number.isFinite(Number(v))) continue;
+            if (CORE_VARIABLES.includes(k)) rel.core[k] = clamp100(v);
+            if (DERIVED_VARIABLES.includes(k)) rel.derived[k] = clamp100(v);
+        }
+
+        if (!Object.keys(rel.core).length && !Object.keys(rel.derived).length) {
+            rel.status = 'uninitialized';
+        }
+
+        profile.initialRelations.push(rel);
     }
 
-    if (!Object.keys(rel.core).length && !Object.keys(rel.derived).length) {
-        rel.status = 'uninitialized';
-    }
-
-    profile.initialRelations.push(rel);
     return profile;
 }
 
-function applyProfile(profile) {
+function parseInitBundle(payload, cardName, userName) {
+    if (!payload || typeof payload !== 'object') throw new Error('PSY_INIT payload missing');
+
+    cardName = normName(cardName);
+    const rawProfiles = Array.isArray(payload.profiles) ? payload.profiles : [payload];
+    if (!rawProfiles.length) throw new Error('PSY_INIT profiles is empty');
+
+    const explicitContainer = typeof payload.cardIsContainer === 'boolean' ? payload.cardIsContainer : null;
+    const profileNames = rawProfiles.map(p => normName(p?.character)).filter(Boolean);
+    const inferredContainer = explicitContainer !== null
+        ? explicitContainer
+        : Boolean(cardName && profileNames.length && profileNames.every(name => name !== cardName));
+
+    let usableProfiles = rawProfiles;
+    if (inferredContainer && cardName) {
+        usableProfiles = rawProfiles.filter(p => normName(p?.character) !== cardName);
+    }
+    if (!usableProfiles.length) throw new Error('PSY_INIT contains no usable real actor profiles');
+
+    const profiles = [];
+    const registrations = [];
+
+    for (const p of usableProfiles.slice(0, 8)) {
+        const actorName = normName(p?.character);
+        if (!actorName) continue;
+
+        const eligibility = p?.eligibility ?? {};
+        const source = String(eligibility?.source ?? '').trim();
+        const evidence = String(eligibility?.evidence ?? '').trim();
+
+        if (!['character_card','world_info'].includes(source) || !evidence) {
+            console.warn('[Psychology Engine] skipped transient/ineligible actor', actorName, p);
+            continue;
+        }
+        if (inferredContainer && actorName === cardName) continue;
+
+        profiles.push(profileFromInitPayload(p, actorName, userName, cardName));
+        registrations.push({ name: actorName, source, evidence, sourceCard: cardName });
+    }
+
+    if (!profiles.length) throw new Error('PSY_INIT did not contain any eligible persistent actor profiles');
+
+    return {
+        cardContext: cardName,
+        cardIsContainer: inferredContainer,
+        profiles,
+        registrations,
+    };
+}
+
+function applyInitBundle(bundle) {
+    const cardName = normName(bundle?.cardContext);
+    const profiles = Array.isArray(bundle?.profiles) ? bundle.profiles : [];
+    const registrations = Array.isArray(bundle?.registrations) ? bundle.registrations : [];
+
+    if (cardName) {
+        const context = ensureCardContext(cardName);
+        context.isContainer = Boolean(bundle.cardIsContainer);
+        context.actorNames = [...new Set(profiles.map(p => normName(p.character)).filter(Boolean))];
+        context.updatedAt = nowIso();
+        if (context.isContainer) purgeContainerIdentity(cardName);
+    }
+
+    for (const reg of registrations) {
+        registerActor(reg.name, reg.source, reg.evidence, reg.sourceCard);
+    }
+    for (const profile of profiles) {
+        if (isEligibleActor(profile.character)) applyProfile(profile, cardName);
+    }
+}
+
+function applyProfile(profile, sourceCard = '') {
     const s = getState();
     const name = normName(profile.character);
     const ch = ensureCharacter(name);
@@ -516,6 +787,10 @@ function applyProfile(profile) {
     ch.profileStatus = 'confirmed';
     ch.personalityControl = clone(profile.personalityControl);
     ch.profileConfirmedAt = nowIso();
+    ch.sourceCards ??= [];
+
+    const card = normName(sourceCard || profile.sourceCard);
+    if (card && !ch.sourceCards.includes(card)) ch.sourceCards.push(card);
 
     for (const rel of profile.initialRelations ?? []) {
         const edge = ensureEdge(name, rel.target);
@@ -546,34 +821,27 @@ function applyProfile(profile) {
 function activeNamesFromRecentChat() {
     const c = ctx();
     const names = new Set();
+    const user = currentUserName();
+    if (user) names.add(user);
 
-    if (c?.name1) names.add(normName(c.name1));
-    if (c?.name2) names.add(normName(c.name2));
-
-    const recent = (c?.chat ?? []).slice(-8);
-    for (const m of recent) {
-        if (m?.name) names.add(normName(m.name));
+    for (const m of (c?.chat ?? []).slice(-10)) {
+        const name = normName(m?.name);
+        if (name && isEligibleActor(name)) names.add(name);
     }
-
+    for (const name of eligibleActorNames()) names.add(name);
     return [...names].filter(Boolean);
 }
 
 function relevantEdges() {
     const s = getState();
     const active = new Set(activeNamesFromRecentChat());
-    const char = currentCharacterName();
     const user = currentUserName();
 
     return Object.values(s.relations)
         .filter(e => e.status !== 'uninitialized')
-        .filter(e =>
-            active.has(e.observer) ||
-            active.has(e.target) ||
-            e.observer === char ||
-            e.target === char ||
-            e.observer === user ||
-            e.target === user
-        )
+        .filter(e => isEligibleActor(e.observer))
+        .filter(e => e.target === user || isEligibleActor(e.target))
+        .filter(e => active.has(e.observer) || active.has(e.target) || e.target === user)
         .sort((a,b) => String(b.lastUpdatedAt ?? '').localeCompare(String(a.lastUpdatedAt ?? '')))
         .slice(0, Math.max(1, Number(getSettings().maxEdgesInjected) || 8));
 }
@@ -603,22 +871,25 @@ function buildProtocolPrompt() {
     const settings = getSettings();
     if (!settings.enabled || !settings.injectRuntime) return '';
 
-    const char = currentCharacterName();
+    const cardName = currentCharacterName();
     const user = currentUserName();
-    if (!char) return '';
-
-    ensureCharacter(char);
+    if (!cardName) return '';
 
     const state = getState();
-    const ch = state.characters[char];
-    const needsInit = settings.autoInitialize && !profileExists(char);
+    const cardContext = state.cardContexts?.[cardName] ?? null;
+    const pendingActors = uninitializedActorNames();
+    const needsInit = needsInitializationForContext(cardName);
 
     const runtime = {
-        currentCharacter: char,
+        cardContext: {
+            name: cardName,
+            isContainer: cardContext?.isContainer ?? 'unknown',
+            knownActors: cardContext?.actorNames ?? [],
+        },
         user,
-        profileStatus: ch?.profileStatus ?? 'uninitialized',
-        personalityControl: ch?.psychologyProfile?.personalityControl ?? null,
-        styleTraits: ch?.psychologyProfile?.styleTraits ?? null,
+        actorRegistry: actorRegistryForPrompt(),
+        actorProfiles: actorProfilesForPrompt(),
+        uninitializedActors: pendingActors,
         relations: relevantEdges().map(relationForPrompt),
     };
 
@@ -627,97 +898,148 @@ function buildProtocolPrompt() {
         : '';
 
     const initInstruction = needsInit ? `
-INITIALIZATION REQUIRED FOR ${char}
+ACTOR INITIALIZATION IS REQUIRED.
 
-In this SAME normal roleplay response, after writing the roleplay prose, append an invisible HTML comment:
+IDENTITY RULE — VERY IMPORTANT:
+"${cardName}" is the SillyTavern CARD CONTEXT NAME.
+A card context name is NOT automatically a psychological character.
+
+First determine:
+- If "${cardName}" is the name of ONE actual person/character, set "cardIsContainer": false.
+- If "${cardName}" is a work title, scenario title, group title, family title,
+  multi-character card title, narrator/container label, or otherwise not a real
+  person in the story, set "cardIsContainer": true.
+
+When cardIsContainer=true:
+- NEVER create a profile whose character name is "${cardName}".
+- NEVER use "${cardName}" as observer/target/knownBy.
+- Use the individual real character names instead.
+
+PERSISTENT ACTOR ELIGIBILITY GATE:
+
+A person appearing in prose is NOT automatically a persistent psychology actor.
+
+Only create a persistent profile if:
+1. source = "character_card": the person is a principal/main character explicitly
+   defined by the current character card/scenario data; OR
+2. source = "world_info": the person is an explicitly defined named recurring
+   character in currently available World Info / lore context.
+
+DO NOT register generic or incidental NPCs such as shop clerks, guards, teachers,
+servants, doctors, passers-by, drivers, unnamed enemies, or one-scene roles merely
+because they appear in the current scene.
+
+Transient NPCs may participate in events, but must not receive persistent Profile
+or relation edges.
+
+Prefer only 1–4 newly eligible actors per response. Do not initialize a huge cast.
+
+Already registered persistent actors are listed in Current runtime.actorRegistry.
+Do not duplicate them.
+
+In this SAME normal roleplay response, after the visible RP prose, append:
 
 <!--PSY_INIT
 {STRICT_JSON}
 /PSY_INIT-->
 
-The JSON must have this shape:
+Use this shape:
 {
-  "character": "${char}",
-  "evidenceSummary": ["1-4 concise observations supported by the character card/scenario; do not use the current user's new message as evidence for stable personality"],
-  "personalityControl": {
-    "SelfControl": 0.0,
-    "Assertiveness": 0.0,
-    "VulnerabilityTolerance": 0.0,
-    "PrivacyBias": 0.0,
-    "Empathy": 0.0,
-    "CognitiveFlexibility": 0.0,
-    "NeedForControl": 0.0
-  },
-  "styleTraits": {
-    "warmth": 0.0,
-    "sociability": 0.0,
-    "romanticExpressiveness": 0.0,
-    "jealousyProneness": 0.0,
-    "dependencyProneness": 0.0,
-    "angerProneness": 0.0,
-    "fearProneness": 0.0,
-    "shameProneness": 0.0,
-    "curiosityProneness": 0.0,
-    "disgustSensitivity": 0.0,
-    "respectSensitivity": 0.0
-  },
-  "initialRelation": {
-    "target": "${user}",
-    "evidence": ["0-4 card/scenario-supported reasons"],
-    "values": {
-      "Love": null,
-      "Trust": null,
-      "Security": null,
-      "Intimacy": null,
-      "Dependency": null,
-      "Exclusivity": null,
-      "Resentment": null,
-      "Respect": null,
-      "Mood": null,
-      "Arousal": null,
-      "Anger": null,
-      "Fear": null,
-      "Shyness": null,
-      "Hurt": null,
-      "Longing": null,
-      "RelationalThreat": null,
-      "Guilt": null,
-      "Disgust": null,
-      "Jealousy": null,
-      "AffectionSeeking": null,
-      "Shame": null,
-      "Curiosity": null,
-      "Gratitude": null,
-      "Attraction": null,
-      "Pride": null,
-      "Loneliness": null,
-      "Admiration": null
+  "cardContext": "${cardName}",
+  "cardIsContainer": true,
+  "profiles": [
+    {
+      "character": "REAL INDIVIDUAL CHARACTER NAME",
+      "eligibility": {
+        "source": "character_card|world_info",
+        "evidence": "brief reason this is a principal card character or explicit recurring World Info character"
+      },
+      "evidenceSummary": [
+        "1-4 concise stable-personality observations supported by card/scenario"
+      ],
+      "personalityControl": {
+        "SelfControl": 0.0,
+        "Assertiveness": 0.0,
+        "VulnerabilityTolerance": 0.0,
+        "PrivacyBias": 0.0,
+        "Empathy": 0.0,
+        "CognitiveFlexibility": 0.0,
+        "NeedForControl": 0.0
+      },
+      "styleTraits": {
+        "warmth": 0.0,
+        "sociability": 0.0,
+        "romanticExpressiveness": 0.0,
+        "jealousyProneness": 0.0,
+        "dependencyProneness": 0.0,
+        "angerProneness": 0.0,
+        "fearProneness": 0.0,
+        "shameProneness": 0.0,
+        "curiosityProneness": 0.0,
+        "disgustSensitivity": 0.0,
+        "respectSensitivity": 0.0
+      },
+      "initialRelations": [
+        {
+          "target": "${user}",
+          "evidence": ["0-4 relation-specific reasons"],
+          "values": {
+            "Love": 75,
+            "Trust": 60,
+            "Respect": 55
+          }
+        },
+        {
+          "target": "ANOTHER REAL ACTOR",
+          "evidence": ["only when an established relation is actually supported"],
+          "values": {
+            "Trust": 45,
+            "Intimacy": 50
+          }
+        }
+      ]
     }
-  }
+  ]
 }
 
-PersonalityControl/styleTraits use [0,1].
-Initial relationship values use the FULL [-100,100] intensity scale:
--100 extreme negative; -75 strong negative; -50 clear negative; -25 mild negative;
-0 genuinely neutral; +25 mild positive; +50 moderate; +75 strong; +90 very strong.
-CRITICAL: 1 is NOT "true"; 1 means almost neutral.
-Use null for insufficient information.
-Do not turn "feeling exists" into value 1.
+Initialization rules:
+- PersonalityControl/styleTraits use [0,1].
+- Relationship values use the FULL [-100,100] intensity scale.
+- -100 extreme negative; -75 strong negative; -50 clear negative; -25 mild negative.
+- 0 genuinely neutral; +25 mild positive; +50 moderate; +75 strong; +90 very strong.
+- 1 is NOT "true"; 1 means almost neutral.
+- Every profile MUST include eligibility.source and eligibility.evidence.
+- eligibility.source may ONLY be "character_card" or "world_info".
+- Incidental/transient NPCs must NOT appear in profiles.
+- Relationship "values" should be SPARSE: include only variables supported by evidence.
+- Omitted variable = insufficient information.
+- Do not create every possible pair in a multi-person scene.
+- Established actor→actor relationships may be initialized when directly supported.
+- Do not use the user's latest message as evidence for stable personality.
 ${initRetry}
-` : '';
+` : `
+No PSY_INIT is required unless a genuinely new real actor appears who is not
+listed in runtime.actorProfiles. If that happens, you MAY append a PSY_INIT
+block using the same multi-profile format, containing only the new actor(s).
+`;
 
     return `
-[Psychology Engine — SINGLE-PASS RUNTIME]
+[Psychology Engine — SINGLE-PASS MULTI-ACTOR RUNTIME]
 
 This instruction is part of the SAME main SillyTavern generation.
 Use the current main API, model, preset, sampling settings, and normal RP context.
 
-The psychology state below is authoritative CURRENT internal state.
-Character card/personality determines HOW a state is expressed.
-The dynamic psychology state determines WHAT the character currently feels.
-Do not erase a strong current state merely to preserve a static character stereotype.
+IDENTITY MODEL:
+Card Context != Actor.
+The card context name may only be a container/title.
+Psychological variables belong to REAL INDIVIDUAL ACTORS.
 
-Do not expose psychology numbers, engine terminology, or control JSON in visible roleplay prose.
+The psychology states below are authoritative CURRENT internal states.
+Character card/personality determines HOW an actor expresses a state.
+Dynamic psychology state determines WHAT that actor currently feels.
+Do not erase strong current states merely to preserve a static stereotype.
+
+Do not expose psychology numbers, engine terminology, or control JSON in visible RP prose.
 Do not mechanically map a value to a fixed gesture.
 Infer behavior from:
 state + personality + relationship + scene + social context + recent behavior.
@@ -727,25 +1049,25 @@ ${JSON.stringify(runtime, null, 2)}
 
 ${initInstruction}
 
-AFTER the normal roleplay prose, ALWAYS append one invisible HTML comment:
+AFTER the normal visible RP prose, ALWAYS append one invisible HTML comment:
 
 <!--PSY_UPDATE
 {STRICT_JSON}
 /PSY_UPDATE-->
 
-Use this compact JSON shape:
+Use this compact shape:
 {
   "events": [
     {
       "id": "e1",
       "summary": "short objective event",
-      "knownBy": ["character names who actually know this event"]
+      "knownBy": ["REAL ACTOR NAME"]
     }
   ],
   "updates": [
     {
-      "observer": "character whose psychology changes",
-      "target": "specific target",
+      "observer": "REAL ACTOR WHOSE PSYCHOLOGY CHANGES",
+      "target": "REAL PERSON/TARGET",
       "basedOn": ["e1"],
       "coreDelta": {"Trust": 1},
       "derivedDelta": {"Curiosity": 2},
@@ -757,7 +1079,14 @@ Use this compact JSON shape:
   ]
 }
 
-Rules for PSY_UPDATE:
+PSY_UPDATE rules:
+- observer MUST be a REGISTERED persistent actor from runtime.actorRegistry.
+- target MUST be either the user or a REGISTERED persistent actor.
+- Transient NPCs may appear in event summaries/knownBy, but must NOT be observer/target of persistent updates.
+- Card/group/scenario titles must never be observer/target.
+- In multi-character cards, evaluate EACH actor independently.
+- A single event may update A→user and B→user differently.
+- Actor→actor updates are allowed when the event genuinely changes that relationship.
 - No Knowledge => No Update.
 - Narrator knowledge is NOT character knowledge.
 - Do not infer the user's hidden feelings; normally do NOT use the user as observer.
@@ -771,7 +1100,6 @@ Rules for PSY_UPDATE:
 - Delta +1 means a TINY increase, not boolean true.
 - If no meaningful psychological change occurred, use "updates": [].
 - Keep the control block concise.
-- The HTML comments are machine control data and must remain outside visible RP prose.
 `.trim();
 }
 
@@ -840,7 +1168,10 @@ function applyUpdatePayload(payload, messageId) {
     for (const e of payload.events ?? []) {
         const id = eventKey(messageId, e?.id);
         const knownBy = Array.isArray(e?.knownBy)
-            ? e.knownBy.map(normName).filter(Boolean)
+            ? e.knownBy
+                .map(normName)
+                .filter(Boolean)
+                .filter(name => !isContainerName(name))
             : [];
 
         const record = {
@@ -871,7 +1202,20 @@ function applyUpdatePayload(payload, messageId) {
         const target = normName(u?.target);
 
         if (!observer || !target || observer === target) continue;
-        if (observer === currentUserName()) {
+
+        // Persistent psychology belongs only to registered eligible actors.
+        if (!isEligibleActor(observer)) {
+            console.warn('[Psychology Engine] Actor Eligibility Gate blocked observer', observer, u);
+            continue;
+        }
+
+        const user = currentUserName();
+        if (target !== user && !isEligibleActor(target)) {
+            console.warn('[Psychology Engine] Actor Eligibility Gate blocked target', target, u);
+            continue;
+        }
+
+        if (observer === user) {
             console.warn('[Psychology Engine] ignored user-as-observer update', u);
             continue;
         }
@@ -942,9 +1286,96 @@ function applyUpdatePayload(payload, messageId) {
     }
 }
 
+
+function getMessageMeta(msg) {
+    msg.extra ??= {};
+    msg.extra[MSG_META_KEY] ??= {
+        fingerprint: null,
+        visibleFingerprint: null,
+        processedAt: null,
+        errors: [],
+        appliedSwipeKey: null,
+        swipeCache: {},
+        transaction: null,
+    };
+
+    const meta = msg.extra[MSG_META_KEY];
+    meta.swipeCache ??= {};
+    return meta;
+}
+
+function compactOldTransactions(keepMessageId) {
+    const chat = ctx()?.chat ?? [];
+    for (let i = 0; i < chat.length; i++) {
+        if (i === keepMessageId) continue;
+        const meta = chat[i]?.extra?.[MSG_META_KEY];
+        if (!meta?.transaction?.beforeState) continue;
+
+        // v0.3.1 deliberately supports exact rollback only for the latest
+        // assistant response. Remove historical full snapshots to prevent
+        // chat-file growth.
+        meta.transaction = {
+            finalizedAt: nowIso(),
+            rollbackAvailable: false,
+        };
+    }
+}
+
+async function rollbackMessageTransaction(messageId, { silent = false } = {}) {
+    const c = ctx();
+    const id = Number(messageId);
+    const msg = c?.chat?.[id];
+    if (!msg || msg.is_user || msg.is_system) return false;
+
+    if (id !== latestAssistantMessageId()) {
+        if (!silent) {
+            toast('warning', 'v0.3.1 只对最新一条 AI 回复提供精确 rollback；历史消息暂不回退。');
+        }
+        return false;
+    }
+
+    const meta = getMessageMeta(msg);
+    const beforeState = meta?.transaction?.beforeState;
+
+    if (!beforeState) return false;
+
+    c.chatMetadata[METADATA_KEY] = clone(beforeState);
+
+    const restored = getState();
+    restored.runtime.lastRollback = {
+        messageId: id,
+        swipeKey: meta.appliedSwipeKey,
+        at: nowIso(),
+    };
+
+    // Keep the per-swipe cache, but clear "currently applied" markers.
+    meta.transaction = null;
+    meta.fingerprint = null;
+    meta.visibleFingerprint = null;
+    meta.appliedSwipeKey = null;
+    meta.processedAt = null;
+    meta.errors = [];
+
+    saveState();
+    await c?.saveChat?.();
+
+    renderStatus();
+    renderStateViewer();
+    renderDebug();
+
+    if (!silent) toast('info', '已回退上一条 AI 回复造成的心理状态变化。');
+    return true;
+}
+
+function cachedControlForSwipe(meta, swipeKey, visibleFingerprint) {
+    const cached = meta?.swipeCache?.[swipeKey];
+    if (!cached) return null;
+    if (cached.visibleFingerprint !== visibleFingerprint) return null;
+    return cached;
+}
+
 async function processAssistantMessage(messageId) {
     const c = ctx();
-    const s = getState();
 
     let id = Number(messageId);
     if (!Number.isInteger(id) || !c?.chat?.[id]) id = (c?.chat?.length ?? 1) - 1;
@@ -952,51 +1383,130 @@ async function processAssistantMessage(messageId) {
     const msg = c?.chat?.[id];
     if (!msg || msg.is_user || msg.is_system) return;
 
-    msg.extra ??= {};
-
+    const meta = getMessageMeta(msg);
+    const swipeKey = currentSwipeKey(msg);
     const text = String(msg.mes ?? '');
+
     const initBlock = extractControlBlock(text, 'init');
     const updateBlock = extractControlBlock(text, 'update');
+    const visibleText = stripControlBlocks(text);
+    const visibleFingerprint = fastFingerprint(visibleText);
 
-    // Avoid re-applying exactly the same processed message.
-    const controlFingerprint = `${initBlock?.jsonText ?? ''}\n---\n${updateBlock?.jsonText ?? ''}`;
-    if (msg.extra?.[MSG_META_KEY]?.fingerprint === controlFingerprint && controlFingerprint.trim()) {
+    const rawControlFingerprint = fastFingerprint(
+        `${initBlock?.jsonText ?? ''}\n---\n${updateBlock?.jsonText ?? ''}`
+    );
+
+    // If this exact selected swipe has already been applied and the message is
+    // simply being rendered/saved again after our own block stripping, do nothing.
+    if (
+        meta.appliedSwipeKey === swipeKey &&
+        meta.visibleFingerprint === visibleFingerprint &&
+        (
+            (!initBlock && !updateBlock) ||
+            meta.fingerprint === rawControlFingerprint
+        )
+    ) {
         return;
     }
 
+    // If a different version of the latest assistant message is about to be
+    // applied and the old version still owns an active transaction, restore the
+    // exact pre-message state first.
+    if (meta?.transaction?.beforeState && id === latestAssistantMessageId()) {
+        await rollbackMessageTransaction(id, { silent: true });
+    }
+
+    const freshMeta = getMessageMeta(msg);
+    const cached = cachedControlForSwipe(freshMeta, swipeKey, visibleFingerprint);
+
+    let initPayload = null;
+    let updatePayload = null;
+    let initRaw = initBlock?.jsonText ?? null;
+    let updateRaw = updateBlock?.jsonText ?? null;
+
     const debug = {
         messageId: id,
+        swipeKey,
         at: nowIso(),
-        initRaw: initBlock?.jsonText ?? null,
-        updateRaw: updateBlock?.jsonText ?? null,
+        source: {
+            init: initBlock ? 'message' : cached?.initParsed ? 'swipe-cache' : null,
+            update: updateBlock ? 'message' : cached?.updateParsed ? 'swipe-cache' : null,
+        },
+        initRaw,
+        updateRaw,
         initParsed: null,
         updateParsed: null,
         errors: [],
+        rollbackSnapshotSaved: false,
     };
 
-    // Apply initialization first, so update deltas can build on the initial state.
-    if (initBlock) {
+    // Prefer control blocks physically present in the selected swipe.
+    // If SillyTavern previously persisted our stripped visible text, reuse the
+    // cached parsed control block for this exact swipe/visible-text pair.
+    try {
+        if (initBlock) initPayload = parseJsonTolerant(initBlock.jsonText);
+        else if (cached?.initParsed) initPayload = clone(cached.initParsed);
+
+        if (updateBlock) updatePayload = parseJsonTolerant(updateBlock.jsonText);
+        else if (cached?.updateParsed) updatePayload = clone(cached.updateParsed);
+    } catch (err) {
+        debug.errors.push(`CONTROL JSON: ${String(err?.message ?? err)}`);
+    }
+
+    debug.initParsed = initPayload;
+    debug.updateParsed = updatePayload;
+
+    const hasUsableControl = Boolean(initPayload || updatePayload);
+
+    // No control data for this selected swipe: after a reroll, the previous
+    // transaction remains rolled back and this swipe contributes no state change.
+    if (!hasUsableControl) {
+        const state = getState();
+        state.runtime.lastProcessedMessageId = id;
+        state.runtime.lastProcessedAt = nowIso();
+        state.runtime.lastControlRaw = { init: initRaw, update: updateRaw };
+        state.runtime.lastControlParsed = { init: null, update: null };
+        state.runtime.lastControlError = debug.errors.length ? debug.errors : null;
+
+        freshMeta.fingerprint = rawControlFingerprint;
+        freshMeta.visibleFingerprint = visibleFingerprint;
+        freshMeta.appliedSwipeKey = swipeKey;
+        freshMeta.processedAt = nowIso();
+        freshMeta.errors = debug.errors;
+        freshMeta.transaction = null;
+
+        saveState();
+        await c?.saveChat?.();
+        await refreshInjection();
+        renderStatus();
+        renderStateViewer();
+        renderDebug();
+        return;
+    }
+
+    // Full engine-state snapshot before this message. This is intentionally
+    // simple and exact: clamp effects, Profile initialization, Events,
+    // Knowledge, Threads and Memories all roll back together.
+    const beforeState = clone(getState());
+
+    // Apply initialization first so update deltas can build on initialized state.
+    if (initPayload) {
         try {
-            const initPayload = parseJsonTolerant(initBlock.jsonText);
-            debug.initParsed = initPayload;
+            const cardName = currentCharacterName();
+            const bundle = parseInitBundle(initPayload, cardName, currentUserName());
 
-            const charName = normName(initPayload?.character || msg.name || currentCharacterName());
-            const profile = profileFromInitPayload(initPayload, charName, currentUserName());
-
-            applyProfile(profile);
-            s.runtime.initRetryReason = null;
+            applyInitBundle(bundle);
+            getState().runtime.initRetryReason = null;
         } catch (err) {
             const reason = String(err?.message ?? err);
             debug.errors.push(`PSY_INIT: ${reason}`);
-            s.runtime.initRetryReason = reason;
+            getState().runtime.initRetryReason = reason;
             console.error('[Psychology Engine] PSY_INIT rejected', err);
         }
     }
 
-    if (updateBlock) {
+    if (updatePayload) {
         try {
-            const updatePayload = parseJsonTolerant(updateBlock.jsonText);
-            debug.updateParsed = updatePayload;
             applyUpdatePayload(updatePayload, id);
         } catch (err) {
             const reason = String(err?.message ?? err);
@@ -1005,27 +1515,47 @@ async function processAssistantMessage(messageId) {
         }
     }
 
-    s.runtime.lastProcessedMessageId = id;
-    s.runtime.lastProcessedAt = nowIso();
-    s.runtime.lastControlRaw = {
-        init: initBlock?.jsonText ?? null,
-        update: updateBlock?.jsonText ?? null,
+    const state = getState();
+    state.runtime.lastProcessedMessageId = id;
+    state.runtime.lastProcessedAt = nowIso();
+    state.runtime.lastControlRaw = {
+        init: initRaw,
+        update: updateRaw,
     };
-    s.runtime.lastControlParsed = {
-        init: debug.initParsed,
-        update: debug.updateParsed,
+    state.runtime.lastControlParsed = {
+        init: initPayload,
+        update: updatePayload,
     };
-    s.runtime.lastControlError = debug.errors.length ? debug.errors : null;
+    state.runtime.lastControlError = debug.errors.length ? debug.errors : null;
 
-    msg.extra[MSG_META_KEY] = {
-        fingerprint: controlFingerprint,
-        processedAt: nowIso(),
-        errors: debug.errors,
+    freshMeta.fingerprint = rawControlFingerprint;
+    freshMeta.visibleFingerprint = visibleFingerprint;
+    freshMeta.appliedSwipeKey = swipeKey;
+    freshMeta.processedAt = nowIso();
+    freshMeta.errors = debug.errors;
+    freshMeta.transaction = {
+        beforeState,
+        appliedAt: nowIso(),
+        swipeKey,
+        rollbackAvailable: true,
     };
+
+    freshMeta.swipeCache[swipeKey] = {
+        visibleFingerprint,
+        initRaw,
+        updateRaw,
+        initParsed: clone(initPayload),
+        updateParsed: clone(updatePayload),
+        cachedAt: nowIso(),
+    };
+
+    debug.rollbackSnapshotSaved = true;
 
     if (getSettings().hideControlBlocks && (initBlock || updateBlock)) {
-        msg.mes = stripControlBlocks(text);
+        msg.mes = visibleText;
     }
+
+    compactOldTransactions(id);
 
     saveState();
     await c?.saveChat?.();
@@ -1083,15 +1613,38 @@ function renderStatus() {
     const el = document.getElementById('psy_status');
     const initEl = document.getElementById('psy_init_status');
 
-    const char = currentCharacterName();
-    const confirmed = profileExists(char);
+    const cardName = currentCharacterName();
+    const s = getState();
+    const context = s.cardContexts?.[cardName];
+    const actors = confirmedActorNames();
 
-    if (el) el.textContent = getSettings().enabled ? 'Single-pass 已启用' : '已关闭';
+    if (el) {
+        el.textContent = getSettings().enabled
+            ? 'Single-pass 已启用 · Multi-Actor · 最新回复可Rollback'
+            : '已关闭';
+    }
 
     if (initEl) {
-        if (!char) initEl.innerHTML = '<span class="psy-warn">未检测到当前角色</span>';
-        else if (confirmed) initEl.innerHTML = `<span class="psy-ok">✓ ${escapeHtml(char)} 已初始化</span>`;
-        else initEl.innerHTML = `<span class="psy-warn">○ ${escapeHtml(char)} 将在下一次主回复中自动初始化</span>`;
+        if (!cardName) {
+            initEl.innerHTML = '<span class="psy-warn">未检测到当前卡片上下文</span>';
+            return;
+        }
+
+        if (context?.isContainer === true) {
+            const names = (context.actorNames ?? []).filter(profileExists);
+            initEl.innerHTML =
+                `<span class="psy-ok">✓ 卡片容器：${escapeHtml(cardName)}</span>` +
+                `<div>实际角色：${names.length ? names.map(escapeHtml).join('、') : '等待初始化'}</div>`;
+        } else if (context?.isContainer === false && profileExists(cardName)) {
+            initEl.innerHTML = `<span class="psy-ok">✓ ${escapeHtml(cardName)} 已初始化</span>`;
+        } else if (actors.length) {
+            initEl.innerHTML =
+                `<span class="psy-warn">○ ${escapeHtml(cardName)} 身份待确认</span>` +
+                `<div>已知实际角色：${actors.map(escapeHtml).join('、')}</div>`;
+        } else {
+            initEl.innerHTML =
+                `<span class="psy-warn">○ ${escapeHtml(cardName)} 将在下一次主回复中识别实际角色并初始化</span>`;
+        }
     }
 }
 
@@ -1099,7 +1652,10 @@ function renderStateViewer() {
     const box = document.getElementById('psy_state_viewer');
     if (!box) return;
 
+    const user = currentUserName();
     const rows = Object.values(getState().relations)
+        .filter(edge => isEligibleActor(edge.observer))
+        .filter(edge => edge.target === user || isEligibleActor(edge.target))
         .sort((a,b) => edgeKey(a.observer,a.target).localeCompare(edgeKey(b.observer,b.target)));
 
     if (!rows.length) {
@@ -1136,9 +1692,14 @@ function renderDebug() {
 
     const rt = getState().runtime ?? {};
     box.value = JSON.stringify({
+        cardContexts: getState().cardContexts,
+        actorRegistry: getState().actorRegistry,
+        confirmedActors: confirmedActorNames(),
+        uninitializedActors: uninitializedActorNames(),
         lastProcessedMessageId: rt.lastProcessedMessageId,
         lastProcessedAt: rt.lastProcessedAt,
         initRetryReason: rt.initRetryReason,
+        lastRollback: rt.lastRollback,
         lastControlRaw: rt.lastControlRaw,
         lastControlParsed: rt.lastControlParsed,
         lastControlError: rt.lastControlError,
@@ -1178,7 +1739,7 @@ function buildSettingsUi() {
     wrapper.innerHTML = `
     <div class="inline-drawer">
       <div class="inline-drawer-toggle inline-drawer-header">
-        <b>Psychology Engine v0.3 · Single-pass</b>
+        <b>Psychology Engine v0.3.3 · Eligibility Gate</b>
         <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
       </div>
 
@@ -1253,9 +1814,8 @@ function buildSettingsUi() {
 }
 
 async function onChatChanged() {
-    const char = currentCharacterName();
-    if (char) ensureCharacter(char);
-
+    // Do NOT automatically create currentCharacterName() as an actor.
+    // It may be only a multi-character card/group/scenario title.
     await refreshInjection();
     renderStatus();
     renderStateViewer();
@@ -1263,20 +1823,41 @@ async function onChatChanged() {
 }
 
 async function onMessageSent() {
-    // This is the important single-pass step:
-    // refresh immediately before the normal main generation.
+    // Once the user advances the story, exact rollback snapshots older than the
+    // latest assistant response are intentionally compacted.
+    compactOldTransactions(-1);
+
+    // Refresh immediately before the normal main generation.
     await refreshInjection();
 }
 
 async function onMessageReceived(messageId) {
-    // No second model call. We only parse what the MAIN model already generated.
+    // No second model call. Parse what the MAIN model already generated.
     setTimeout(() => processAssistantMessage(messageId), 0);
 }
 
 async function onMessageSwiped(messageId) {
-    // Basic support: process the newly selected/generated swipe if it contains
-    // fresh control blocks. Exact historical rollback remains a later feature.
-    setTimeout(() => processAssistantMessage(messageId), 0);
+    const id = Number(messageId);
+
+    // MESSAGE_SWIPED may fire BEFORE a newly requested swipe begins generation.
+    // Roll back immediately so the new main generation sees the pre-reply state.
+    await rollbackMessageTransaction(id, { silent: true });
+    await refreshInjection();
+
+    // When switching to an already-existing swipe there may be no new
+    // MESSAGE_RECEIVED event. Give GENERATION_STARTED a moment to fire; if no
+    // generation is active, apply the selected existing swipe (or its cache).
+    setTimeout(() => {
+        if (!generationActive) processAssistantMessage(id);
+    }, 250);
+}
+
+function onGenerationStarted() {
+    generationActive = true;
+}
+
+function onGenerationEnded() {
+    generationActive = false;
 }
 
 async function init() {
@@ -1305,10 +1886,12 @@ async function init() {
         }
 
         if (et.MESSAGE_SWIPED) es.on(et.MESSAGE_SWIPED,onMessageSwiped);
+        if (et.GENERATION_STARTED) es.on(et.GENERATION_STARTED,onGenerationStarted);
+        if (et.GENERATION_ENDED) es.on(et.GENERATION_ENDED,onGenerationEnded);
     }
 
     await onChatChanged();
-    console.log('[Psychology Engine] v0.3.0 single-pass initialized');
+    console.log('[Psychology Engine] v0.3.3 actor eligibility gate initialized');
 }
 
 window.init = init;

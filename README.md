@@ -1,6 +1,253 @@
+
+### v0.3.3：Actor Eligibility Gate
+
+只有两类人物允许进入持久心理数据库：
+
+```text
+character_card = 当前角色卡明确设定的主要/核心人物
+world_info     = 当前 World Info / lore 中明确设定的具名持续角色
+```
+
+临时 NPC 可以参与事件和 knownBy，但不会自动建立 Profile 或 relation edge。
+
+代码硬门控：
+
+```text
+observer 必须属于 Actor Registry
+target 必须是 user 或 Actor Registry 中的角色
+```
+
+每个 PSY_INIT profile 必须提供 eligibility.source 与 eligibility.evidence。
+否则该人物不会注册为持久 Actor。
+
+这样既避免店员、路人、卫兵等污染数据库，也降低长期 token 消耗。
+Single-pass 与最新回复 Transactional Rollback 保持不变。
+
+
+### v0.3.2：Card Context ≠ Actor
+
+v0.3.1 的核心身份假设是：
+
+```text
+SillyTavern 当前角色卡名称 = 心理角色名称
+```
+
+这对普通单人卡成立，但对多人卡会失败。
+
+例如：
+
+```text
+角色卡名称：亲吻姐姐
+实际角色：住之江亚香、住之江理香
+```
+
+旧版会错误创建：
+
+```text
+亲吻姐姐 → user
+```
+
+v0.3.2 引入两个独立概念：
+
+```text
+Card Context
+= SillyTavern 当前卡片 / 群组 / 场景上下文名称
+
+Actor
+= 故事中真正具有独立心理状态的人物
+```
+
+因此卡名不再自动调用 `ensureCharacter(cardName)`。
+
+#### 多人初始化
+
+首次主回复可以返回：
+
+```json
+{
+  "cardContext": "亲吻姐姐",
+  "cardIsContainer": true,
+  "profiles": [
+    {
+      "character": "住之江亚香",
+      "personalityControl": {},
+      "styleTraits": {},
+      "initialRelations": []
+    },
+    {
+      "character": "住之江理香",
+      "personalityControl": {},
+      "styleTraits": {},
+      "initialRelations": []
+    }
+  ]
+}
+```
+
+插件分别保存：
+
+```text
+住之江亚香 Profile
+住之江理香 Profile
+```
+
+不会再保存：
+
+```text
+亲吻姐姐 Profile
+```
+
+#### 多人关系
+
+每个 Profile 支持：
+
+```text
+initialRelations[]
+```
+
+因此除了：
+
+```text
+A → user
+B → user
+```
+
+还可以在角色卡确实提供既有关系时初始化：
+
+```text
+A → B
+B → A
+```
+
+由于关系有方向，这两个状态仍然独立。
+
+#### 动态多人更新
+
+`PSY_UPDATE` 现在明确要求：
+
+```text
+observer / target / knownBy
+```
+
+只能使用真实人物名称。
+
+多人同一事件可以得到不同更新：
+
+```text
+A → user : Trust +2
+B → user : Hurt +3
+A → B    : RelationalThreat +1
+```
+
+代码层也会拒绝已知 Card Container 作为心理主体。
+
+#### 旧伪角色清理
+
+如果一次 `PSY_INIT` 判断：
+
+```text
+cardIsContainer = true
+```
+
+插件会清理此前同名的旧伪角色及其关系，例如：
+
+```text
+亲吻姐姐 → user
+```
+
+这用于迁移 v0.3.0 / v0.3.1 已经产生的错误状态。
+
+#### Single-pass / Rollback 保持不变
+
+v0.3.2 仍然：
+
+```text
+无 generateRaw
+无 generateQuietPrompt
+无第二次模型分析
+```
+
+所有心理识别、RP正文和心理更新仍搭乘同一次主 API / 主模型 / 主 Preset。
+
+最新 AI 回复的事务式 rollback 也继续保留。
+
+
+### v0.3.1：最新 AI 回复事务式 Rollback
+
+本版不增加任何第二次模型请求。仍然完全使用主 API / 主模型 / 主 Preset 的 Single-pass 架构。
+
+每次应用最新 AI 回复的 `PSY_INIT / PSY_UPDATE` 前，插件保存：
+
+```text
+beforeState
+```
+
+它是 Psychology Engine 在这条回复生效之前的完整状态快照。
+
+因此重新 roll / swipe 最新 AI 回复时：
+
+```text
+旧回复已应用状态
+↓
+恢复 beforeState
+↓
+主模型生成新 swipe
+↓
+解析新 PSY_INIT / PSY_UPDATE
+↓
+从同一个 beforeState 提交新状态
+```
+
+这会一起回退：
+
+- Core / Derived 数值
+- Character Profile / 首次初始化
+- Events
+- Knowledge
+- Active Threads
+- Memories
+- Runtime Psychology state
+
+不使用“delta 反向相减”，因此不会被 `[-100,100]` clamp 等非线性操作破坏。
+
+#### Swipe Cache
+
+插件会按当前消息的 `swipe_id` 缓存该 swipe 的已解析控制块。
+
+如果 SillyTavern 保存聊天时已经把隐藏控制块从可见正文中移除，再切回旧 swipe 时仍可以用缓存重新提交对应心理状态。
+
+#### 生成时序保护
+
+SillyTavern 的 `MESSAGE_SWIPED` 可能先于新 swipe 的实际生成触发。
+
+v0.3.1 因此：
+
+```text
+MESSAGE_SWIPED
+→ 立即 rollback
+→ 刷新心理状态注入
+→ 如果随后进入 GENERATION_STARTED：等待新主回复
+→ 如果只是切换现有 swipe：直接应用该 swipe / swipe cache
+```
+
+因此新 roll 的主模型看到的是**旧回复发生之前的心理状态**，而不是已经被旧回复修改过的状态。
+
+#### 当前范围
+
+v0.3.1 只保证：
+
+```text
+最新一条 AI 回复
+```
+
+的精确 rollback。
+
+历史消息的重新编辑、删除或历史 swipe 仍不做级联重算。为了避免聊天文件膨胀，旧消息的完整 `beforeState` 快照会被清理。
+
+
 # SillyTavern Psychology Engine
 
-## v0.3.0 — Single-pass Architecture
+## v0.3.3 — Actor Eligibility Gate
 
 v0.3.0 不再做任何第二次 LLM 请求。
 

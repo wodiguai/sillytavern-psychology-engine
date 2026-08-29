@@ -1,16 +1,17 @@
 {
-  "display_name": "Psychology Engine",
+  "display_name": "Psychology Engine v0.4.2",
   "loading_order": 80,
   "requires": [],
   "optional": [],
   "js": "index.js",
   "css": "style.css",
   "author": "OpenAI / XuYan collaborative design",
-  "version": "0.3.3",
+  "version": "0.4.2",
   "homePage": "https://github.com/wodiguai/sillytavern-psychology-engine",
   "auto_update": true,
   "minimum_client_version": "1.14.0",
   "hooks": {
     "activate": "init"
-  }
+  },
+  "description": "Single-pass RP psychology state engine with exact regenerate/swipe rollback, trait preservation, dynamic domains, familiarity, decay, and unresolved-thread semantic gating."
 }
